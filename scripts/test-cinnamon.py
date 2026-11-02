@@ -9,6 +9,7 @@ Logs and screenshots are retained in the printed temporary directory.
 import argparse
 import json
 import os
+import re
 from pathlib import Path
 import select
 import shutil
@@ -107,12 +108,16 @@ def main():
         time.sleep(5)
         config = Path(env["XDG_CONFIG_HOME"]) / "tinyhand-rs/settings.conf"
         config.parent.mkdir()
-        config.write_text("sound=false\nstyle=laser\n")
+        config.write_text("sound=false\nstyle=laser\ncolor=0\nmatch_color=false\n")
         probe = start(["stdbuf", "-oL", "xev", "-name", "TinyHand input probe",
                        "-geometry", "240x140+20+20", "-event", "button"], "input")
         time.sleep(1)
         click()
         assert clicks() > 0, "Input probe is not receiving baseline clicks"
+        run("import", "-window", "root", str(output / "desktop-before.png"))
+        work = run("xprop", "-root", "_NET_WORKAREA").stdout.split("=",1)[1]
+        work = list(map(int,re.findall(r"-?\d+",work)))
+        work_bottom = work[1] + work[3]
         rss = []
         for cycle in range(args.cycles):
             # Missing desktop variables must not re-enable the unsafe tray.
@@ -120,6 +125,13 @@ def main():
             env["DESKTOP_SESSION"] = ""
             app = start([str(binary)], f"app-{cycle + 1}")
             wait_for(visible, "Overlay did not appear")
+            if cycle == 0:
+                time.sleep(.15)
+                run("import", "-window", "root", str(output / "toolbar-placement.png"))
+                baseline = Image.open(output / "desktop-before.png").convert("RGB")
+                placed = Image.open(output / "toolbar-placement.png").convert("RGB")
+                for y in range(work_bottom-8,work_bottom):
+                    assert placed.getpixel((640,y)) == baseline.getpixel((640,y)), "Toolbar overlaps the desktop panel gap"
             before = clicks()
             click()
             assert clicks() == before, "Active overlay leaked a click"
@@ -152,7 +164,7 @@ def main():
                 assert ink_pixels > 100, f"Drag did not render ink: {ink_pixels} pixels"
                 # Navigate every sidebar page and exercise the real controls.
                 run("xdotool", "click", "5")
-                run("xdotool", "mousemove", "770", "750", "click", "1")
+                run("xdotool", "mousemove", "770", "725", "click", "1")
                 time.sleep(.2)
                 for tab in range(6):
                     run("xdotool", "mousemove", "380", str(221 + tab * 34), "click", "1")
@@ -210,7 +222,31 @@ def main():
                 run("xdotool", "mousemove", "540", "204", "click", "1")
                 run("xdotool", "mousemove", "526", "322", "click", "1")
                 wait_for(lambda: "custom_enabled=false" in config.read_text(), "Built-in pointer did not replace custom hand")
-                time.sleep(3.3)
+                # Enable automatic pointer colour, then sample opaque active
+                # strokes so transparency/fade cannot hide a wrong palette.
+                run("xdotool", "mousemove", "380", "323", "click", "1")
+                run("xdotool", "mousemove", "644", "291", "click", "1")
+                wait_for(lambda: "match_color=true" in config.read_text(), "Match-pointer mode did not persist")
+                run("xdotool", "mousemove", "320", "174", "click", "1")
+                for index, name, expected_rgb, y in [
+                    (2,"coral",(255,41,31),200), (6,"blue",(47,134,240),240),
+                    (4,"robot",(22,168,122),280), (8,"lemon",(242,183,5),320)]:
+                    run("xdotool", "mousemove", "770", "725", "click", "1")
+                    run("xdotool", "mousemove", "380", "255", "click", "1")
+                    run("xdotool", "mousemove", str(526 + index % 9 * 50),
+                        str(321 + index // 9 * 52), "click", "1")
+                    wait_for(lambda: f"style={name}" in config.read_text(), "Pointer change did not persist")
+                    run("xdotool", "mousemove", "320", "174", "click", "1")
+                    run("xdotool", "mousemove", "250", str(y), "mousedown", "1",
+                        "mousemove", "500", str(y))
+                    path = output / f"ink-{name}.png"
+                    def ink_matches():
+                        run("import", "-window", "root", str(path))
+                        actual = Image.open(path).convert("RGB").getpixel((350,y))
+                        return max(abs(a-b) for a,b in zip(actual,expected_rgb)) <= 2
+                    wait_for(ink_matches, f"{name} did not render the upstream ink colour", timeout=4)
+                    run("xdotool", "mouseup", "1")
+                time.sleep(4.0)
                 ticks_before = sum(map(int, Path(f"/proc/{app.pid}/stat").read_text().split()[13:15]))
                 time.sleep(2)
                 ticks_after = sum(map(int, Path(f"/proc/{app.pid}/stat").read_text().split()[13:15]))

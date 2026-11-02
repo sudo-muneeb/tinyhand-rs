@@ -1,4 +1,19 @@
+use crate::colors::{self, Rgb};
 use std::time::{Duration, Instant};
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Brush {
+    pub color: Rgb,
+    pub width: f64,
+}
+impl Default for Brush {
+    fn default() -> Self {
+        Self {
+            color: colors::PURPLE,
+            width: 5.0,
+        }
+    }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Point {
@@ -14,10 +29,11 @@ impl Point {
 pub struct Stroke {
     pub points: Vec<Point>,
     pub released: Option<Instant>,
+    pub brush: Brush,
 }
 pub struct Ink {
     pub strokes: Vec<Stroke>,
-    start: Option<Point>,
+    start: Option<(Point, Brush)>,
     active: bool,
 }
 
@@ -36,15 +52,19 @@ impl Ink {
         }
     }
     pub fn down(&mut self, p: Point) {
+        self.down_with_brush(p, Brush::default());
+    }
+    pub fn down_with_brush(&mut self, p: Point, brush: Brush) {
         self.end(Instant::now());
-        self.start = Some(p);
+        self.start = Some((p, brush));
     }
     pub fn move_to(&mut self, p: Point) {
-        if let Some(start) = self.start {
+        if let Some((start, brush)) = self.start {
             if !self.active && start.distance(p) >= 4.0 {
                 self.strokes.push(Stroke {
                     points: vec![start],
                     released: None,
+                    brush,
                 });
                 self.active = true;
             }
@@ -91,6 +111,27 @@ impl Ink {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn a_new_brush_does_not_recolour_or_resize_existing_ink() {
+        let mut ink = Ink::new();
+        let now = Instant::now();
+        let first = Brush {
+            color: colors::RED,
+            width: 3.0,
+        };
+        let next = Brush {
+            color: colors::hex(0x2F86F0),
+            width: 9.0,
+        };
+        ink.down_with_brush(Point { x: 0.0, y: 0.0 }, first);
+        ink.move_to(Point { x: 20.0, y: 0.0 });
+        ink.end(now);
+        ink.down_with_brush(Point { x: 0.0, y: 40.0 }, next);
+        ink.move_to(Point { x: 20.0, y: 40.0 });
+        ink.end(now);
+        assert_eq!(ink.strokes[0].brush, first);
+        assert_eq!(ink.strokes[1].brush, next);
+    }
     #[test]
     fn click_is_not_a_stroke_drag_fades() {
         let mut ink = Ink::new();

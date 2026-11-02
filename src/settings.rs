@@ -47,6 +47,7 @@ pub enum Action {
     Thickness(f64),
     Fade(f64),
     Color(usize),
+    MatchColor,
     Sound(usize),
     Volume(f64),
     LaserSound,
@@ -143,6 +144,9 @@ pub fn hit(x: f64, y: f64, ui: SettingsUi) -> Option<Action> {
             }
         }
         3 => {
+            if contains(x, y, (330.0, 121.0, 28.0, 28.0)) {
+                return Some(Action::MatchColor);
+            }
             for color in 0..8 {
                 if contains(x, y, (364.0 + color as f64 * 34.0, 121.0, 28.0, 28.0)) {
                     return Some(Action::Color(color));

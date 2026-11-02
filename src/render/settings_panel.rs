@@ -191,10 +191,23 @@ impl Renderer {
                 3 => {
                     caption(c, 100.0, "Ink");
                     card(c, 112.0, 174.0);
-                    row(c, 112.0, "Ink colour", "");
-                    for (i, color) in COLORS.iter().enumerate() {
+                    row(
+                        c,
+                        112.0,
+                        "Ink colour",
+                        if config.match_color {
+                            "Matches each pointer."
+                        } else {
+                            "Use a fixed colour."
+                        },
+                    );
+                    if config.match_color {
+                        dot(c, 344.0, 135.0, 13.5, (0.9, 0.9, 0.95));
+                    }
+                    rainbow(c, 344.0, 135.0);
+                    for (i, color) in SWATCHES.iter().enumerate() {
                         let x = 378.0 + i as f64 * 34.0;
-                        if i == config.color {
+                        if !config.match_color && i == config.color {
                             dot(c, x, 135.0, 13.5, (0.9, 0.9, 0.95));
                         }
                         dot(c, x, 135.0, 10.0, *color);
@@ -384,7 +397,7 @@ impl Renderer {
 
     unsafe fn thumbnail(&mut self, c: *mut Cairo, index: usize, x: f64, y: f64, size: f64) {
         if index == 36 {
-            dot(c, x + size / 2.0, y + size / 2.0, 5.0, (1.0, 0.18, 0.16));
+            dot(c, x + size / 2.0, y + size / 2.0, 5.0, colors::RED);
             return;
         }
         if self.previews.is_empty() {
@@ -584,4 +597,30 @@ unsafe fn sidebar_icon(c: *mut Cairo, x: f64, y: f64, tab: usize) {
         }
     }
     cairo_stroke(c);
+}
+
+unsafe fn rainbow(c: *mut Cairo, x: f64, y: f64) {
+    let colours = [
+        (1.0, 0.2, 0.2),
+        (1.0, 0.6, 0.0),
+        (1.0, 0.9, 0.1),
+        (0.1, 0.8, 0.4),
+        (0.1, 0.5, 1.0),
+        (0.7, 0.3, 0.9),
+    ];
+    for (i, (r, g, b)) in colours.into_iter().enumerate() {
+        cairo_new_path(c);
+        cairo_move_to(c, x, y);
+        cairo_arc(
+            c,
+            x,
+            y,
+            10.0,
+            i as f64 * std::f64::consts::TAU / 6.0,
+            (i + 1) as f64 * std::f64::consts::TAU / 6.0,
+        );
+        cairo_close_path(c);
+        cairo_set_source_rgba(c, r, g, b, 1.0);
+        cairo_fill(c);
+    }
 }

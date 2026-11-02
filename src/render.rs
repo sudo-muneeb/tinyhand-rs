@@ -1,3 +1,4 @@
+use crate::colors::{self, Rgb, SWATCHES};
 use crate::config::{Config, STYLES};
 use crate::ffi::*;
 use crate::ink::{Ink, Point};
@@ -8,17 +9,6 @@ use crate::motion::{HandGeometry, HandMotion, HandPose};
 use std::ffi::CString;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
-
-const COLORS: [(f64, f64, f64); 8] = [
-    (0.59, 0.35, 0.91),
-    (1.0, 0.28, 0.3),
-    (1.0, 0.55, 0.0),
-    (0.15, 0.77, 0.35),
-    (0.04, 0.52, 1.0),
-    (0.55, 0.33, 0.95),
-    (1.0, 1.0, 1.0),
-    (0.1, 0.1, 0.12),
-];
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 struct Rect {
@@ -97,6 +87,7 @@ pub struct Renderer {
     pub settings_scale: f64,
     previews: Vec<*mut Surface>,
     custom_loaded: String,
+    custom_ink: Rgb,
     geometry: HandGeometry,
     motion: HandMotion,
     monitor: (i32, i32, i32, i32),
@@ -158,6 +149,7 @@ impl Renderer {
             settings_scale: 1.0,
             previews: Vec::new(),
             custom_loaded: String::new(),
+            custom_ink: colors::PURPLE,
             geometry: HandGeometry::default(),
             motion: HandMotion::default(),
             monitor: (0, 0, width, height),
@@ -229,6 +221,7 @@ impl Renderer {
         self.geometry = hand::measure_hand(hand);
         self.tip = self.geometry.tip;
         self.loaded = 37;
+        self.custom_ink = hand::custom_ink(self.hand, self.geometry.wrist as usize);
         self.custom_loaded = config.custom_path.clone();
         self.invalidate();
         Ok(())
@@ -251,6 +244,18 @@ impl Renderer {
         self.invalidate();
     }
 
+    pub fn ink_color(&self, config: &Config) -> Rgb {
+        if config.match_color {
+            if config.custom_enabled {
+                self.custom_ink
+            } else {
+                colors::pointer_color(config.style)
+            }
+        } else {
+            SWATCHES[config.color.min(7)]
+        }
+    }
+
     pub fn pointer_down(&mut self) {
         self.motion.press();
     }
@@ -269,19 +274,37 @@ impl Renderer {
     }
 
     pub fn place_bar(&mut self, monitor: (i32, i32, i32, i32)) {
+        self.place_bar_with_work_area(monitor, None);
+    }
+
+    pub fn place_bar_with_work_area(
+        &mut self,
+        monitor: (i32, i32, i32, i32),
+        work_area: Option<(i32, i32, i32, i32)>,
+    ) {
         self.monitor = monitor;
         let (x, y, w, h) = monitor;
+        let (bx, by, bw, bh) = work_area
+            .and_then(|(wx, wy, ww, wh)| {
+                let left = x.max(wx);
+                let top = y.max(wy);
+                let right = (x + w).min(wx + ww);
+                let bottom = (y + h).min(wy + wh);
+                (right > left && bottom > top).then_some((left, top, right - left, bottom - top))
+            })
+            .unwrap_or(monitor);
         self.ui_scale = self
             .requested_scale
-            .min((w as f64 - 16.0) / 488.0)
+            .min((bw as f64 - 16.0) / 488.0)
             .clamp(0.5, 3.0);
-        self.bar_x = (x as f64 + (w as f64 - 488.0 * self.ui_scale) / 2.0).max(x as f64);
-        self.bar_y = (y + h - 18) as f64 - 54.0 * self.ui_scale;
+        self.bar_x = (bx as f64 + (bw as f64 - 488.0 * self.ui_scale) / 2.0).max(bx as f64);
+        self.bar_y = (by + bh) as f64 - (8.0 + 54.0) * self.ui_scale;
         self.monitor_h = h as f64;
         self.settings_scale = self
             .requested_scale
             .min((w as f64 - 32.0) / settings::WIDTH)
             .min((h as f64 - 110.0) / settings::HEIGHT)
+            .min((self.bar_y - y as f64 - 24.0) / settings::HEIGHT)
             .clamp(0.4, 3.0);
         self.settings_x = x as f64 + (w as f64 - settings::WIDTH * self.settings_scale) / 2.0;
         self.settings_y = y as f64 + (h as f64 - settings::HEIGHT * self.settings_scale) / 2.0;
@@ -314,7 +337,7 @@ impl Renderer {
             press,
         );
         let pointer = self.hand_bounds(config, cursor, pose);
-        let ink_bounds = ink_bounds(ink, config.thickness);
+        let ink_bounds = ink_bounds(ink);
         let ui_bounds = self.ui_bounds(ui);
         let mut damage = Rect {
             x: 0.0,
@@ -357,7 +380,7 @@ impl Renderer {
         cairo_set_operator(c, 2); // OVER
         cairo_set_line_cap(c, 1);
         cairo_set_line_join(c, 1);
-        let (r, g, b) = COLORS[config.color];
+        let (r, g, b) = self.ink_color(config);
         let fade = Duration::from_secs_f64(config.fade);
         for stroke in &ink.strokes {
             if stroke.points.len() < 2 {
@@ -366,8 +389,9 @@ impl Renderer {
             let alpha = stroke.released.map_or(1.0, |t| {
                 1.0 - now.saturating_duration_since(t).as_secs_f64() / fade.as_secs_f64()
             });
-            cairo_set_source_rgba(c, r, g, b, alpha.max(0.0) * 0.8);
-            cairo_set_line_width(c, config.thickness);
+            let (sr, sg, sb) = stroke.brush.color;
+            cairo_set_source_rgba(c, sr, sg, sb, alpha.max(0.0));
+            cairo_set_line_width(c, stroke.brush.width);
             cairo_move_to(c, stroke.points[0].x, stroke.points[0].y);
             for p in &stroke.points[1..] {
                 cairo_line_to(c, p.x, p.y);
@@ -402,11 +426,11 @@ impl Renderer {
             cairo_stroke(c);
         }
         if config.style == 36 && !config.custom_enabled {
-            cairo_set_source_rgba(c, 1.0, 0.2, 0.15, 0.22);
+            cairo_set_source_rgba(c, colors::RED.0, colors::RED.1, colors::RED.2, 0.22);
             cairo_new_path(c);
             cairo_arc(c, cursor.x, cursor.y, 20.0, 0.0, std::f64::consts::TAU);
             cairo_fill(c);
-            cairo_set_source_rgba(c, 1.0, 0.2, 0.15, 1.0);
+            cairo_set_source_rgba(c, colors::RED.0, colors::RED.1, colors::RED.2, 1.0);
             cairo_new_path(c);
             cairo_arc(
                 c,
@@ -417,7 +441,7 @@ impl Renderer {
                 std::f64::consts::TAU,
             );
             cairo_fill(c);
-            cairo_set_source_rgba(c, 1.0, 0.85, 0.8, 1.0);
+            cairo_set_source_rgba(c, 1.0, 0.86, 0.82, 0.95);
             cairo_new_path(c);
             cairo_arc(
                 c,
@@ -575,15 +599,16 @@ impl Renderer {
     }
 }
 
-fn ink_bounds(ink: &Ink, thickness: f64) -> Option<Rect> {
-    let radius = thickness * 0.5 + 3.0;
+fn ink_bounds(ink: &Ink) -> Option<Rect> {
     ink.strokes
         .iter()
-        .flat_map(|stroke| stroke.points.iter())
-        .fold(None, |bounds: Option<Rect>, point| {
-            let next = Rect::around(*point, radius);
-            Some(bounds.map_or(next, |rect| rect.union(next)))
+        .flat_map(|stroke| {
+            stroke
+                .points
+                .iter()
+                .map(move |point| Rect::around(*point, stroke.brush.width * 0.5 + 3.0))
         })
+        .reduce(|bounds, next| bounds.union(next))
 }
 
 unsafe fn set_text(c: *mut Cairo, x: f64, y: f64, size: f64, s: &str) {
@@ -677,11 +702,22 @@ mod tests {
                 settings_scale: 1.0,
                 previews: Vec::new(),
                 custom_loaded: String::new(),
+                custom_ink: colors::PURPLE,
                 geometry: HandGeometry::default(),
                 motion: HandMotion::default(),
                 monitor: (0, 0, 800, 600),
             };
             r.select(0).unwrap();
+            r.place_bar_with_work_area((0, 0, 1920, 1080), Some((0, 0, 1920, 1035)));
+            assert_eq!(
+                r.bar_y + 54.0 * r.ui_scale,
+                1027.0,
+                "toolbar must have an 8px gap above the Cinnamon panel"
+            );
+            assert_eq!(
+                r.monitor_h, 1080.0,
+                "panel placement must not shrink the hand's monitor geometry"
+            );
             r.place_bar((0, 0, 800, 600));
             let mut ink = Ink::new();
             let now = Instant::now();
@@ -875,6 +911,38 @@ mod tests {
                 let path = CString::new(format!("/tmp/tinyhand-tap-{name}.png")).unwrap();
                 assert_eq!(cairo_surface_write_to_png(surface, path.as_ptr()), 0);
             }
+            let mut mixed = Ink::new();
+            for (y, color) in [(180.0, colors::RED), (220.0, colors::hex(0x2F86F0))] {
+                mixed.down_with_brush(
+                    Point { x: 100.0, y },
+                    crate::ink::Brush { color, width: 6.0 },
+                );
+                mixed.move_to(Point { x: 200.0, y });
+                mixed.end(now);
+            }
+            let fixed = Config {
+                style: 36,
+                color: 5,
+                match_color: false,
+                ..Config::default()
+            };
+            r.paint(
+                &fixed,
+                &mixed,
+                Point { x: 760.0, y: 30.0 },
+                (SettingsUi::default(), 0),
+                None,
+                now,
+            );
+            cairo_surface_flush(surface);
+            assert!(
+                red(150, 180) > 240 && *data.add(180 * stride + 150 * 4) < 60,
+                "the red stroke must stay red after selecting yellow"
+            );
+            assert!(
+                *data.add(220 * stride + 150 * 4) > 200 && red(150, 220) < 70,
+                "the blue stroke must stay blue"
+            );
         }
     }
 }

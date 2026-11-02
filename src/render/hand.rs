@@ -2,6 +2,62 @@
 //! following the geometry used by upstream ArmView.swift and HandAsset.
 use super::*;
 
+pub(super) unsafe fn custom_ink(image: *mut Surface, hand_rows: usize) -> Rgb {
+    // Upstream HandMaker.ink: weighted dominant RGB bucket, then make pale
+    // colours readable. Restrict built-in-shaped imports to the hand, not rod.
+    cairo_surface_flush(image);
+    let width = cairo_image_surface_get_width(image) as usize;
+    let height = cairo_image_surface_get_height(image) as usize;
+    let stride = cairo_image_surface_get_stride(image) as usize;
+    let data = cairo_image_surface_get_data(image);
+    if data.is_null() {
+        return colors::PURPLE;
+    }
+    let mut buckets = [(0_u32, 0.0, 0.0, 0.0); 216];
+    for y in (0..height.min(hand_rows)).step_by(3) {
+        for x in (0..width).step_by(3) {
+            let pixel = data.add(y * stride + x * 4);
+            let a = *pixel.add(3) as f64;
+            if a <= 200.0 {
+                continue;
+            }
+            let (r, g, b) = (
+                *pixel.add(2) as f64 / a,
+                *pixel.add(1) as f64 / a,
+                *pixel as f64 / a,
+            );
+            let key = (r * 5.0) as usize * 36 + (g * 5.0) as usize * 6 + (b * 5.0) as usize;
+            let bucket = &mut buckets[key.min(215)];
+            bucket.0 += 1;
+            bucket.1 += r;
+            bucket.2 += g;
+            bucket.3 += b;
+        }
+    }
+    let mut best = (-1.0, colors::PURPLE);
+    for (n, r, g, b) in buckets.into_iter().filter(|e| e.0 > 0) {
+        let (r, g, b) = (r / n as f64, g / n as f64, b / n as f64);
+        let hi = r.max(g).max(b);
+        let lo = r.min(g).min(b);
+        let sat = if hi == 0.0 { 0.0 } else { (hi - lo) / hi };
+        let lum = 0.3 * r + 0.59 * g + 0.11 * b;
+        let score = n as f64 * (0.25 + sat) * if lum > 0.12 && lum < 0.85 { 1.0 } else { 0.15 };
+        if score > best.0 {
+            best = (score, (r, g, b));
+        }
+    }
+    let (r, g, b) = best.1;
+    let hi = r.max(g).max(b);
+    let lo = r.min(g).min(b);
+    if hi - lo < 0.08 {
+        (0.42, 0.45, 0.5)
+    } else if hi > 0.82 {
+        (r * 0.82 / hi, g * 0.82 / hi, b * 0.82 / hi)
+    } else {
+        (r, g, b)
+    }
+}
+
 pub(super) unsafe fn measure_hand(image: *mut Surface) -> HandGeometry {
     cairo_surface_flush(image);
     let w = cairo_image_surface_get_width(image) as usize;

@@ -12,10 +12,10 @@ cp target/release/tinyhand-rs "$stage/usr/bin/"
 cp -R assets "$stage/usr/share/tinyhand-rs/"
 cp tinyhand-rs.desktop "$stage/usr/share/applications/"
 cp assets/icons/tinyhand-rs.svg "$stage/usr/share/icons/hicolor/scalable/apps/"
-cp README.md NOTICE.md LICENSE BUILD_REPORT.md "$stage/usr/share/doc/tinyhand-rs/"
+cp README.md NOTICE.md LICENSE BUILD_REPORT.md UPSTREAM_PARITY.md "$stage/usr/share/doc/tinyhand-rs/"
 cat > "$stage/DEBIAN/control" <<'EOF'
 Package: tinyhand-rs
-Version: 0.1.4
+Version: 0.1.5
 Section: utils
 Priority: optional
 Architecture: amd64
@@ -25,13 +25,13 @@ Recommends: zenity
 Description: Native X11 presentation pointer with fading ink
  36 hand styles and a laser dot, tap sounds, drawing and global shortcuts.
 EOF
-dpkg-deb --build --root-owner-group "$stage" dist/tinyhand-rs_0.1.4_amd64.deb
-portable="dist/tinyhand-rs-0.1.4-linux-x86_64"
+dpkg-deb --build --root-owner-group "$stage" dist/tinyhand-rs_0.1.5_amd64.deb
+portable="dist/tinyhand-rs-0.1.5-linux-x86_64"
 rm -rf "$portable"
 mkdir -p "$portable"
-cp target/release/tinyhand-rs README.md NOTICE.md LICENSE BUILD_REPORT.md tinyhand-rs.desktop "$portable/"
+cp target/release/tinyhand-rs README.md NOTICE.md LICENSE BUILD_REPORT.md UPSTREAM_PARITY.md tinyhand-rs.desktop "$portable/"
 cp -R assets "$portable/"
-tar -C dist -czf dist/tinyhand-rs-0.1.4-linux-x86_64.tar.gz "$(basename "$portable")"
-tar --exclude=target --exclude=dist -czf dist/tinyhand-rs-0.1.4-source.tar.gz \
-  --transform='s,^,tinyhand-rs-0.1.4/,' .
+tar -C dist -czf dist/tinyhand-rs-0.1.5-linux-x86_64.tar.gz "$(basename "$portable")"
+tar --exclude=target --exclude=dist -czf dist/tinyhand-rs-0.1.5-source.tar.gz \
+  --transform='s,^,tinyhand-rs-0.1.5/,' .
 rm -rf "$stage" "$portable"

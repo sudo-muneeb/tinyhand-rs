@@ -3,7 +3,7 @@
 Native Rust and X11 presentation pointer inspired by [TinyHand](https://github.com/nilbuild/tinyhand).
 The original artwork and tap sample are included with attribution and their MIT license.
 
-**Cinnamon compatibility:** Version 0.1.4 disables the legacy XEmbed tray on
+**Cinnamon compatibility:** Version 0.1.5 disables the legacy XEmbed tray on
 Cinnamon/Muffin. The tray path reproduced the compositor crash in an isolated
 Cinnamon session, with the same stack trace as the earlier live crashes.
 Detection checks both desktop variables and the actual X11 window manager.
@@ -15,7 +15,7 @@ The former Cinnamon startup block and development override are no longer used.
 On a compatible Debian based x86_64 X11 desktop:
 
 ```sh
-sudo apt install ./tinyhand-rs_0.1.4_amd64.deb
+sudo apt install ./tinyhand-rs_0.1.5_amd64.deb
 ```
 
 Launch **TinyHand for Linux** in the application menu, or run `tinyhand-rs`.
@@ -56,6 +56,9 @@ grip and press motion have settled.
 | Tray middle click | Quit the process |
 
 The toolbar appears near the bottom of the monitor containing the pointer.
+It uses the desktop's usable work area and leaves an 8 logical pixel gap above
+the Cinnamon panel. The settings screen is drawn with Cairo directly on X11;
+GTK/Qt widgets are not used for that screen. Zenity provides the PNG file chooser.
 The XEmbed tray icon appears if a compatible system tray is running, except on
 Cinnamon where the legacy tray path is disabled. If there is
 no tray, use the global toggle shortcut. Closing presentation mode leaves the
@@ -67,6 +70,11 @@ The settings window follows the original TinyHand design: a dark sidebar with
 General, Pointers, Appearance, Drawing, Sound, and About pages. It offers hand
 thumbnails, PNG import, size, shadow, tilt, opacity, ink colour, fade, thickness,
 all six original tap sounds, volume, start at login, and editable shortcuts.
+Drawing defaults to **Match the pointer**, with the original colour for each
+hand and the laser. The rainbow swatch restores automatic matching; the eight
+solid swatches select a fixed colour. Existing strokes retain their own colour
+and thickness when you change a setting. Imported hands derive a readable
+colour from their artwork.
 Click a shortcut row and press a letter with Control, Alt or Shift. Settings are saved
 in `${XDG_CONFIG_HOME:-~/.config}/tinyhand-rs/settings.conf`.
 Start at login writes an XDG autostart entry in the same config tree.
@@ -148,3 +156,10 @@ Cinnamon must also be installed. Logs and screenshots stay in the printed
 temporary directory. The test never sends input to your existing display.
 Sound output and physical multi monitor switching remain unverified.
 No Wayland global input capture is claimed. See `BUILD_REPORT.md` for results.
+The complete source comparison and remaining feature gaps are recorded in
+`UPSTREAM_PARITY.md`. To verify all 37 colour definitions, 36 artworks and six
+sound files against a local original checkout, run:
+
+```sh
+python3 scripts/check-upstream.py --upstream /home/minty/data/tinyhand-original
+```

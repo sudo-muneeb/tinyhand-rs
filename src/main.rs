@@ -5,7 +5,7 @@ use std::sync::mpsc::{self, Receiver};
 use std::time::{Duration, Instant};
 use tinyhand_rs::config::{self, Config};
 use tinyhand_rs::ffi::*;
-use tinyhand_rs::ink::{Ink, Point};
+use tinyhand_rs::ink::{Brush, Ink, Point};
 use tinyhand_rs::render::{asset_dir, Renderer};
 use tinyhand_rs::settings::{self, Action, SettingsUi};
 use tinyhand_rs::sound::Sound;
@@ -96,6 +96,66 @@ unsafe fn muffin_window_manager(display: *mut Display, root: Window) -> bool {
     muffin
 }
 
+// EWMH work areas exclude desktop panels and docks. Read only the active
+// desktop's four CARDINALs, keeping the property allocation bounded.
+unsafe fn desktop_work_area(display: *mut Display, root: Window) -> Option<(i32, i32, i32, i32)> {
+    unsafe fn read(
+        display: *mut Display,
+        root: Window,
+        name: &CStr,
+        offset: i64,
+        length: i64,
+    ) -> Option<Vec<u64>> {
+        let atom = XInternAtom(display, name.as_ptr(), 0);
+        let (mut ty, mut format, mut count, mut after) = (0, 0, 0, 0);
+        let mut data = ptr::null_mut();
+        let status = XGetWindowProperty(
+            display,
+            root,
+            atom,
+            offset,
+            length,
+            0,
+            6,
+            &mut ty,
+            &mut format,
+            &mut count,
+            &mut after,
+            &mut data,
+        );
+        let result = if status == 0
+            && ty == 6
+            && format == 32
+            && count <= length as u64
+            && !data.is_null()
+        {
+            Some(std::slice::from_raw_parts(data.cast::<u64>(), count as usize).to_vec())
+        } else {
+            None
+        };
+        if !data.is_null() {
+            XFree(data.cast());
+        }
+        result
+    }
+    let desktop = read(display, root, c"_NET_CURRENT_DESKTOP", 0, 1)
+        .and_then(|v| v.first().copied())
+        .unwrap_or(0)
+        .min(4096);
+    let values = read(display, root, c"_NET_WORKAREA", desktop as i64 * 4, 4)?;
+    if values.len() != 4 {
+        return None;
+    }
+    let (x, y, w, h) = (
+        values[0] as u32 as i32,
+        values[1] as u32 as i32,
+        values[2] as i32,
+        values[3] as i32,
+    );
+    (w > 0 && h > 0 && x.checked_add(w).is_some() && y.checked_add(h).is_some())
+        .then_some((x, y, w, h))
+}
+
 extern "C" fn stop_signal(_: i32) {
     STOP.store(true, Ordering::SeqCst);
 }
@@ -137,6 +197,7 @@ struct App {
     docked: bool,
     last_dock: Instant,
     monitors: Vec<(i32, i32, i32, i32)>,
+    work_area: Option<(i32, i32, i32, i32)>,
     last_monitor_check: Instant,
     toggle_key: (i32, u32),
     clear_key: (i32, u32),
@@ -299,6 +360,7 @@ impl App {
             docked: false,
             last_dock: Instant::now() - Duration::from_secs(2),
             monitors: vec![(0, 0, w, h)],
+            work_area: None,
             last_monitor_check: Instant::now(),
             toggle_key,
             clear_key,
@@ -421,6 +483,7 @@ impl App {
     }
 
     unsafe fn refresh_monitors(&mut self) {
+        self.work_area = desktop_work_area(self.display, self.root);
         self.monitors.clear();
         if XineramaIsActive(self.display) != 0 {
             let mut count = 0;
@@ -454,7 +517,7 @@ impl App {
             })
             .copied()
             .unwrap_or(self.monitors[0]);
-        self.renderer.place_bar(m);
+        self.renderer.place_bar_with_work_area(m, self.work_area);
     }
 
     unsafe fn activate(&mut self) -> Result<(), String> {
@@ -647,7 +710,11 @@ impl App {
             Action::Fade(step) => {
                 self.config.fade = (self.config.fade + step * 0.5).clamp(0.3, 20.0)
             }
-            Action::Color(color) => self.config.color = color,
+            Action::Color(color) => {
+                self.config.color = color;
+                self.config.match_color = false;
+            }
+            Action::MatchColor => self.config.match_color = true,
             Action::Sound(kind) => {
                 self.config.sound = kind > 0;
                 if kind > 0 {
@@ -811,7 +878,13 @@ impl App {
             if self.settings.open {
                 self.settings.open = false;
             } else {
-                self.ink.down(p);
+                self.ink.down_with_brush(
+                    p,
+                    Brush {
+                        color: self.renderer.ink_color(&self.config),
+                        width: self.config.thickness,
+                    },
+                );
                 self.pressed = Some(Instant::now());
                 if self.config.sound
                     && (self.config.style != 36

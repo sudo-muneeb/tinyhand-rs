@@ -15,6 +15,7 @@ pub struct Config {
     pub size: f64,
     pub thickness: f64,
     pub color: usize,
+    pub match_color: bool,
     pub fade: f64,
     pub sound: bool,
     pub volume: f64,
@@ -37,6 +38,7 @@ impl Default for Config {
             size: 0.13,
             thickness: 5.0,
             color: 0,
+            match_color: true,
             fade: 3.0,
             sound: true,
             volume: 0.55,
@@ -65,6 +67,7 @@ impl Config {
 
     pub fn load(path: &std::path::Path) -> Self {
         let mut c = Self::default();
+        let mut match_color = None;
         if let Ok(s) = fs::read_to_string(path) {
             for line in s.lines() {
                 let Some((k, v)) = line.split_once('=') else {
@@ -75,6 +78,7 @@ impl Config {
                     "size" => c.size = num(v, c.size, 0.05, 0.35),
                     "thickness" => c.thickness = num(v, c.thickness, 1.0, 30.0),
                     "color" => c.color = v.parse::<usize>().unwrap_or(0).min(7),
+                    "match_color" => match_color = Some(v == "true"),
                     "fade" => c.fade = num(v, c.fade, 0.3, 20.0),
                     "sound" => c.sound = v == "true",
                     "volume" => c.volume = num(v, c.volume, 0.0, 1.0),
@@ -92,6 +96,11 @@ impl Config {
                 }
             }
         }
+        let legacy_color = c.color;
+        if match_color.is_none() && c.color == 5 {
+            c.color = 0;
+        }
+        c.match_color = match_color.unwrap_or(legacy_color == 0);
         c
     }
 
@@ -106,6 +115,7 @@ impl Config {
             self.angle, self.opacity, self.sound_kind, self.laser_sound,
             self.custom_path.replace(['\n', '\r'], ""), self.custom_enabled));
         s.push_str(&format!("shadow={}\n", self.shadow));
+        s.push_str(&format!("match_color={}\n", self.match_color));
         let temp = path.with_extension("tmp");
         fs::write(&temp, s)?;
         fs::rename(temp, path)
@@ -165,6 +175,27 @@ pub fn update_autostart(enabled: bool, executable: &std::path::Path) -> io::Resu
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn legacy_colours_migrate_without_losing_explicit_overrides() {
+        let path =
+            std::env::temp_dir().join(format!("tinyhand-colour-migration-{}", std::process::id()));
+        fs::write(&path, "color=0\n").unwrap();
+        assert!(
+            Config::load(&path).match_color,
+            "old default purple becomes pointer matching"
+        );
+        fs::write(&path, "color=1\n").unwrap();
+        assert!(!Config::load(&path).match_color, "explicit red stays fixed");
+        fs::write(&path, "color=5\n").unwrap();
+        let old = Config::load(&path);
+        assert_eq!(old.color, 0);
+        assert!(!old.match_color);
+        fs::write(&path, "color=5\nmatch_color=false\n").unwrap();
+        let yellow = Config::load(&path);
+        assert_eq!(yellow.color, 5);
+        assert!(!yellow.match_color);
+        fs::remove_file(path).unwrap();
+    }
     #[test]
     fn settings_roundtrip_and_validation() {
         let path = std::env::temp_dir().join(format!("tinyhand-test-{}-{}", std::process::id(), 1));

@@ -43,6 +43,31 @@ fn release_clear_and_fade_cleanup() {
 }
 
 #[test]
+fn long_drag_keeps_a_bounded_path_and_its_latest_point() {
+    let mut ink = Ink::new();
+    ink.down(Point { x: 0.0, y: 0.0 });
+    for x in 1..30_000 {
+        ink.move_to(Point {
+            x: x as f64,
+            y: 0.0,
+        });
+    }
+    ink.move_to(Point {
+        x: 40_000.0,
+        y: 0.0,
+    });
+    let points = &ink.strokes[0].points;
+    assert!(points.len() <= 8192);
+    assert_eq!(
+        points.last(),
+        Some(&Point {
+            x: 40_000.0,
+            y: 0.0
+        })
+    );
+}
+
+#[test]
 fn every_pointer_asset_and_shortcuts() {
     assert_eq!(STYLES.len(), 37);
     for name in &STYLES[..36] {

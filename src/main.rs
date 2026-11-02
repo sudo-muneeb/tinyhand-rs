@@ -1,21 +1,109 @@
 use std::ffi::{CStr, CString};
 use std::ptr;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
+use std::sync::mpsc::{self, Receiver};
 use std::time::{Duration, Instant};
 use tinyhand_rs::config::{self, Config};
 use tinyhand_rs::ffi::*;
 use tinyhand_rs::ink::{Ink, Point};
 use tinyhand_rs::render::{asset_dir, Renderer};
+use tinyhand_rs::settings::{self, Action, SettingsUi};
 use tinyhand_rs::sound::Sound;
 
 static STOP: AtomicBool = AtomicBool::new(false);
+static LAST_X_ERROR: AtomicU8 = AtomicU8::new(0);
+
+fn cinnamon_session() -> bool {
+    is_cinnamon_desktop(
+        &std::env::var("XDG_CURRENT_DESKTOP").unwrap_or_default(),
+        &std::env::var("DESKTOP_SESSION").unwrap_or_default(),
+    )
+}
+
+fn is_cinnamon_desktop(current: &str, session: &str) -> bool {
+    current.split(':').any(|desktop| {
+        desktop.eq_ignore_ascii_case("cinnamon") || desktop.eq_ignore_ascii_case("x-cinnamon")
+    }) || session.eq_ignore_ascii_case("cinnamon")
+}
+
+fn is_muffin_name(name: &str) -> bool {
+    let name = name.to_ascii_lowercase();
+    name.contains("muffin") || name.contains("cinnamon")
+}
+
+// Check the actual X11 window manager too: desktop environment variables can
+// be absent or stale in terminals, launchers, and nested sessions.
+unsafe fn muffin_window_manager(display: *mut Display, root: Window) -> bool {
+    let mut actual_type = 0;
+    let mut format = 0;
+    let mut count = 0;
+    let mut remaining = 0;
+    let mut data = ptr::null_mut();
+    let check = XInternAtom(display, c"_NET_SUPPORTING_WM_CHECK".as_ptr(), 0);
+    let status = XGetWindowProperty(
+        display,
+        root,
+        check,
+        0,
+        1,
+        0,
+        33,
+        &mut actual_type,
+        &mut format,
+        &mut count,
+        &mut remaining,
+        &mut data,
+    );
+    let wm = if status == 0 && actual_type == 33 && format == 32 && count == 1 && !data.is_null() {
+        *data.cast::<Window>()
+    } else {
+        0
+    };
+    if !data.is_null() {
+        XFree(data.cast());
+    }
+    if wm == 0 {
+        return false;
+    }
+    data = ptr::null_mut();
+    let name = XInternAtom(display, c"_NET_WM_NAME".as_ptr(), 0);
+    let utf8 = XInternAtom(display, c"UTF8_STRING".as_ptr(), 0);
+    let status = XGetWindowProperty(
+        display,
+        wm,
+        name,
+        0,
+        256,
+        0,
+        utf8,
+        &mut actual_type,
+        &mut format,
+        &mut count,
+        &mut remaining,
+        &mut data,
+    );
+    let muffin = status == 0
+        && actual_type == utf8
+        && format == 8
+        && !data.is_null()
+        && is_muffin_name(&String::from_utf8_lossy(std::slice::from_raw_parts(
+            data,
+            count as usize,
+        )));
+    if !data.is_null() {
+        XFree(data.cast());
+    }
+    muffin
+}
+
 extern "C" fn stop_signal(_: i32) {
     STOP.store(true, Ordering::SeqCst);
 }
 extern "C" fn x_error(_: *mut Display, error: *mut XErrorEvent) -> i32 {
     unsafe {
+        LAST_X_ERROR.store((*error).error_code, Ordering::SeqCst);
         eprintln!(
-            "tinyhand-rs: X11 error {} on request {} (shortcut conflict or unsupported visual)",
+            "tinyhand-rs: X11 error {} on request {}",
             (*error).error_code,
             (*error).request_code
         );
@@ -41,7 +129,8 @@ struct App {
     cursor: Point,
     pressed: Option<Instant>,
     active: bool,
-    settings: bool,
+    settings: SettingsUi,
+    import_rx: Option<Receiver<Result<Option<String>, String>>>,
     page: usize,
     capture: Option<bool>,
     quit: bool,
@@ -51,6 +140,8 @@ struct App {
     last_monitor_check: Instant,
     toggle_key: (i32, u32),
     clear_key: (i32, u32),
+    redraw_pending: bool,
+    last_render: Instant,
 }
 
 fn shortcut(display: *mut Display, value: &str) -> (i32, u32) {
@@ -82,6 +173,10 @@ impl App {
         }
         let screen = XDefaultScreen(display);
         let root = XRootWindow(display, screen);
+        let disable_tray = cinnamon_session() || muffin_window_manager(display, root);
+        if disable_tray {
+            eprintln!("tinyhand-rs: legacy tray disabled on Cinnamon/Muffin; use Ctrl+Alt+H to toggle and Escape to release the pointer");
+        }
         let w = XDisplayWidth(display, screen);
         let h = XDisplayHeight(display, screen);
         let mut vi = XVisualInfo::default();
@@ -123,7 +218,7 @@ impl App {
             XCloseDisplay(display);
             return Err("XCreateWindow failed".into());
         }
-        XStoreName(display, window, b"TinyHand overlay\0".as_ptr().cast());
+        XStoreName(display, window, c"TinyHand overlay".as_ptr());
         XShapeCombineRectangles(display, window, 2, 0, 0, ptr::null(), 0, 0, 0);
         let mut tray_attrs = XSetWindowAttributes {
             colormap: cmap,
@@ -131,32 +226,35 @@ impl App {
             event_mask: (1 << 15) | (1 << 2),
             ..Default::default()
         };
-        let tray = XCreateWindow(
-            display,
-            root,
-            0,
-            0,
-            26,
-            26,
-            0,
-            32,
-            1,
-            vi.visual,
-            (1 << 3) | (1 << 11) | (1 << 13),
-            &mut tray_attrs,
-        );
-        XStoreName(
-            display,
-            tray,
-            b"TinyHand: left toggle, right settings, middle quit\0"
-                .as_ptr()
-                .cast(),
-        );
-        let embed = XInternAtom(display, b"_XEMBED_INFO\0".as_ptr().cast(), 0);
-        let info: [usize; 2] = [0, 1];
-        XChangeProperty(display, tray, embed, embed, 32, 0, info.as_ptr().cast(), 2);
+        let tray = if disable_tray {
+            0
+        } else {
+            let tray = XCreateWindow(
+                display,
+                root,
+                0,
+                0,
+                26,
+                26,
+                0,
+                32,
+                1,
+                vi.visual,
+                (1 << 3) | (1 << 11) | (1 << 13),
+                &mut tray_attrs,
+            );
+            XStoreName(
+                display,
+                tray,
+                c"TinyHand: left toggle, right settings, middle quit".as_ptr(),
+            );
+            let embed = XInternAtom(display, c"_XEMBED_INFO".as_ptr(), 0);
+            let info: [usize; 2] = [0, 1];
+            XChangeProperty(display, tray, embed, embed, 32, 0, info.as_ptr().cast(), 2);
+            tray
+        };
         XSelectInput(display, root, 1 << 17);
-        let bitmap = XCreateBitmapFromData(display, root, b"\0".as_ptr().cast(), 1, 1);
+        let bitmap = XCreateBitmapFromData(display, root, c"".as_ptr(), 1, 1);
         let mut black = XColor::default();
         let invisible = XCreatePixmapCursor(display, bitmap, bitmap, &mut black, &mut black, 0, 0);
         XFreePixmap(display, bitmap);
@@ -166,7 +264,9 @@ impl App {
                 Ok(r) => r,
                 Err(e) => {
                     XDestroyWindow(display, window);
-                    XDestroyWindow(display, tray);
+                    if tray != 0 {
+                        XDestroyWindow(display, tray);
+                    }
                     XFreeColormap(display, cmap);
                     XCloseDisplay(display);
                     return Err(e);
@@ -191,7 +291,8 @@ impl App {
             },
             pressed: None,
             active: false,
-            settings: false,
+            settings: SettingsUi::default(),
+            import_rx: None,
             page: 0,
             capture: None,
             quit: false,
@@ -201,7 +302,14 @@ impl App {
             last_monitor_check: Instant::now(),
             toggle_key,
             clear_key,
+            redraw_pending: false,
+            last_render: Instant::now() - Duration::from_millis(34),
         };
+        if let Err(error) = app.renderer.select_config(&app.config) {
+            eprintln!("tinyhand-rs: {error}; using the built-in pointer");
+            app.config.custom_enabled = false;
+            app.renderer.select_config(&app.config)?;
+        }
         app.register_keys();
         XSync(display, 0);
         app.query_pointer();
@@ -212,7 +320,7 @@ impl App {
 
     unsafe fn dock_tray(&mut self) {
         self.last_dock = Instant::now();
-        if self.docked {
+        if self.docked || self.tray == 0 {
             return;
         }
         let name = format!("_NET_SYSTEM_TRAY_S{}", XDefaultScreen(self.display));
@@ -222,11 +330,7 @@ impl App {
         if owner == 0 {
             return;
         }
-        let opcode = XInternAtom(
-            self.display,
-            b"_NET_SYSTEM_TRAY_OPCODE\0".as_ptr().cast(),
-            0,
-        );
+        let opcode = XInternAtom(self.display, c"_NET_SYSTEM_TRAY_OPCODE".as_ptr(), 0);
         let mut message = XEvent {
             client: XClientMessageEvent {
                 type_: 33,
@@ -271,12 +375,21 @@ impl App {
     }
 
     unsafe fn register_keys(&self) {
-        for (key, mods) in [self.toggle_key, self.clear_key] {
+        for (name, (key, mods)) in [
+            (&self.config.toggle, self.toggle_key),
+            (&self.config.clear, self.clear_key),
+        ] {
             for extra in [0, 2, 16, 18] {
+                LAST_X_ERROR.store(0, Ordering::SeqCst);
                 XGrabKey(self.display, key, mods | extra, self.root, 0, 1, 1);
+                XSync(self.display, 0);
+                if LAST_X_ERROR.load(Ordering::SeqCst) == 10 {
+                    eprintln!(
+                        "tinyhand-rs: shortcut {name} with lock mask {extra} is already in use"
+                    );
+                }
             }
         }
-        XFlush(self.display);
     }
     unsafe fn unregister_keys(&self) {
         for (key, mods) in [self.toggle_key, self.clear_key] {
@@ -348,7 +461,10 @@ impl App {
         if self.active {
             return Ok(());
         }
-        let mask = (1 << 6) | (1 << 7) | (1 << 8) | (1 << 2) | (1 << 3);
+        // PointerMotionHintMask would suppress subsequent movement until an
+        // XQueryPointer acknowledgement. Request ordinary motion events;
+        // run() already bounds event batches and rendering frequency.
+        let mask = (1 << 6) | (1 << 2) | (1 << 3);
         let status = XGrabPointer(self.display, self.root, 0, mask, 1, 1, 0, self.invisible, 0);
         if status != 0 {
             return Err(format!(
@@ -356,15 +472,21 @@ impl App {
             ));
         }
         self.active = true;
-        XGrabKey(
-            self.display,
-            XKeysymToKeycode(self.display, 0xff1b) as i32,
-            32768,
-            self.root,
-            0,
-            1,
-            1,
-        );
+        self.query_pointer();
+        self.place_bar();
+        self.renderer.invalidate();
+        let escape = XKeysymToKeycode(self.display, 0xff1b) as i32;
+        for extra in [0, 2, 16, 18] {
+            LAST_X_ERROR.store(0, Ordering::SeqCst);
+            XGrabKey(self.display, escape, extra, self.root, 0, 1, 1);
+            XSync(self.display, 0);
+            if extra == 0 && LAST_X_ERROR.load(Ordering::SeqCst) != 0 {
+                self.active = false;
+                XUngrabPointer(self.display, 0);
+                XFlush(self.display);
+                return Err("Cannot register Escape to leave presentation mode".into());
+            }
+        }
         XMapRaised(self.display, self.window);
         if self.docked {
             self.paint_tray();
@@ -379,19 +501,19 @@ impl App {
             return;
         }
         self.active = false;
+        self.redraw_pending = false;
+        self.pressed = None;
         self.ink.end(Instant::now());
         self.ink.clear();
-        self.settings = false;
+        self.settings.open = false;
         self.page = 0;
         self.capture = None;
         XUngrabKeyboard(self.display, 0);
         XUngrabPointer(self.display, 0);
-        XUngrabKey(
-            self.display,
-            XKeysymToKeycode(self.display, 0xff1b) as i32,
-            32768,
-            self.root,
-        );
+        let escape = XKeysymToKeycode(self.display, 0xff1b) as i32;
+        for extra in [0, 2, 16, 18] {
+            XUngrabKey(self.display, escape, extra, self.root);
+        }
         XUnmapWindow(self.display, self.window);
         if self.docked {
             self.paint_tray();
@@ -399,17 +521,31 @@ impl App {
         XFlush(self.display);
     }
 
-    unsafe fn draw(&self) {
+    fn draw(&mut self) {
         if self.active {
+            self.redraw_pending = true;
+        }
+    }
+
+    unsafe fn render(&mut self, now: Instant) {
+        if self.active && self.redraw_pending {
             self.renderer.paint(
                 &self.config,
                 &self.ink,
                 self.cursor,
-                (self.settings, self.page),
+                (
+                    SettingsUi {
+                        capture: self.capture,
+                        ..self.settings
+                    },
+                    self.page,
+                ),
                 self.pressed,
-                Instant::now(),
+                now,
             );
             XFlush(self.display);
+            self.last_render = now;
+            self.redraw_pending = false;
         }
     }
 
@@ -432,7 +568,7 @@ impl App {
         None
     }
     fn grid_hit(&self, p: Point) -> Option<usize> {
-        if self.page == 0 || self.settings {
+        if self.page == 0 || self.settings.open {
             return None;
         }
         let x = (p.x - self.renderer.bar_x) / self.renderer.ui_scale - 17.0;
@@ -444,47 +580,160 @@ impl App {
         (idx < 37).then_some(idx)
     }
     unsafe fn settings_hit(&mut self, p: Point) -> bool {
-        if !self.settings {
+        if !self.settings.open {
             return false;
         }
-        let x = (p.x - self.renderer.bar_x) / self.renderer.ui_scale;
-        let y = (p.y - self.renderer.bar_y) / self.renderer.ui_scale + 374.0;
-        if !(0.0..488.0).contains(&x) || !(0.0..362.0).contains(&y) {
+        let x = (p.x - self.renderer.settings_x) / self.renderer.settings_scale;
+        let y = (p.y - self.renderer.settings_y) / self.renderer.settings_scale;
+        if !settings::contains(x, y, (0.0, 0.0, settings::WIDTH, settings::HEIGHT)) {
             return false;
         }
-        if (46.0..232.0).contains(&y) {
-            let row = ((y - 46.0) / 31.0) as usize;
-            let direction = if x > 250.0 { 1.0 } else { -1.0 };
-            match row {
-                0 => self.config.size = (self.config.size + direction * 0.01).clamp(0.05, 0.35),
-                1 => self.config.thickness = (self.config.thickness + direction).clamp(1.0, 30.0),
-                2 => {
-                    self.config.color = ((self.config.color as i32
-                        + if direction > 0.0 { 1 } else { 7 })
-                        % 8) as usize
-                }
-                3 => self.config.fade = (self.config.fade + direction * 0.5).clamp(0.3, 20.0),
-                4 => self.config.volume = (self.config.volume + direction * 0.1).clamp(0.0, 1.0),
-                5 => {
-                    self.config.startup = !self.config.startup;
-                    if let Ok(exe) = std::env::current_exe() {
-                        if let Err(e) = config::update_autostart(self.config.startup, &exe) {
-                            eprintln!("Autostart: {e}");
-                        }
-                    }
-                }
-                _ => {}
-            }
-            self.save();
-        } else if (232.0..302.0).contains(&y) {
-            self.capture = Some(y < 263.0);
-            if XGrabKeyboard(self.display, self.root, 0, 1, 1, 0) != 0 {
-                self.capture = None;
-                eprintln!("Cannot capture shortcut: keyboard is busy");
-            }
+        if let Some(action) = settings::hit(x, y, self.settings) {
+            self.settings_action(action);
         }
         true
     }
+
+    unsafe fn settings_action(&mut self, action: Action) {
+        match action {
+            Action::Close => self.settings.open = false,
+            Action::Tab(tab) => {
+                self.settings.tab = tab;
+                self.settings.custom = false;
+            }
+            Action::Custom => self.settings.custom = true,
+            Action::Back => self.settings.custom = false,
+            Action::UseCustom => {
+                if !self.config.custom_path.is_empty() {
+                    self.config.custom_enabled = true;
+                }
+            }
+            Action::Style(style) => {
+                self.config.style = style;
+                self.config.custom_enabled = false;
+            }
+            Action::Reset => {
+                self.config.style = 0;
+                self.config.custom_enabled = false;
+            }
+            Action::Startup => {
+                self.config.startup = !self.config.startup;
+                if let Ok(exe) = std::env::current_exe() {
+                    if let Err(e) = config::update_autostart(self.config.startup, &exe) {
+                        eprintln!("Autostart: {e}");
+                    }
+                }
+            }
+            Action::Capture(toggle) => {
+                self.capture = Some(toggle);
+                if XGrabKeyboard(self.display, self.root, 0, 1, 1, 0) != 0 {
+                    self.capture = None;
+                }
+            }
+            Action::Size(step) => {
+                self.config.size = (self.config.size + step * 0.01).clamp(0.05, 0.35)
+            }
+            Action::Angle(step) => {
+                self.config.angle = (self.config.angle + step * 0.08).clamp(-1.2, 1.2)
+            }
+            Action::Opacity(step) => {
+                self.config.opacity = (self.config.opacity + step * 0.1).clamp(0.2, 1.0)
+            }
+            Action::Shadow => self.config.shadow = !self.config.shadow,
+            Action::Thickness(step) => {
+                self.config.thickness = (self.config.thickness + step).clamp(1.0, 30.0)
+            }
+            Action::Fade(step) => {
+                self.config.fade = (self.config.fade + step * 0.5).clamp(0.3, 20.0)
+            }
+            Action::Color(color) => self.config.color = color,
+            Action::Sound(kind) => {
+                self.config.sound = kind > 0;
+                if kind > 0 {
+                    self.config.sound_kind = kind;
+                    self.sound.tap(self.config.volume, kind);
+                }
+            }
+            Action::Volume(step) => {
+                self.config.volume = (self.config.volume + step * 0.1).clamp(0.0, 1.0)
+            }
+            Action::LaserSound => self.config.laser_sound = !self.config.laser_sound,
+            Action::Clear => self.ink.clear(),
+            Action::Import => {
+                self.choose_custom_hand();
+                return;
+            }
+        }
+        if let Err(e) = self.renderer.select_config(&self.config) {
+            eprintln!("{e}");
+            self.config.custom_enabled = false;
+            self.settings.notice = Some("The imported PNG is unavailable. Choose it again.");
+            let _ = self.renderer.select_config(&self.config);
+        }
+        self.save();
+        self.draw();
+    }
+
+    unsafe fn choose_custom_hand(&mut self) {
+        // Release capture while the native chooser is open. Its subprocess
+        // runs off the event thread; the desktop remains usable throughout.
+        self.deactivate();
+        let (tx, rx) = mpsc::channel();
+        self.import_rx = Some(rx);
+        std::thread::spawn(move || {
+            let result = std::process::Command::new("zenity")
+                .args([
+                    "--file-selection",
+                    "--title=Choose your TinyHand PNG",
+                    "--file-filter=PNG images | *.png",
+                ])
+                .output()
+                .map_err(|e| format!("Cannot open the file chooser: {e}"))
+                .and_then(|out| {
+                    if !out.status.success() {
+                        return Ok(None);
+                    }
+                    let path = String::from_utf8(out.stdout).map_err(|e| e.to_string())?;
+                    Ok(Some(path.trim_end_matches(['\n', '\r']).to_owned()))
+                });
+            let _ = tx.send(result);
+        });
+    }
+
+    unsafe fn poll_import(&mut self) {
+        let Some(result) = self.import_rx.as_ref().and_then(|rx| rx.try_recv().ok()) else {
+            return;
+        };
+        self.import_rx = None;
+        let mut notice = None;
+        if let Ok(Some(path)) = &result {
+            let previous = self.config.clone();
+            self.config.custom_path = path.clone();
+            self.config.custom_enabled = true;
+            if let Err(e) = self.renderer.select_config(&self.config) {
+                eprintln!("Import: {e}");
+                notice = Some("Cannot read that PNG. Try another image.");
+                self.config = previous;
+            } else {
+                self.save();
+            }
+        } else if let Err(e) = result {
+            eprintln!("Import: {e}");
+            notice = Some("Install zenity to choose a PNG file.");
+        }
+        if let Err(e) = self.activate() {
+            eprintln!("{e}");
+        }
+        self.settings = SettingsUi {
+            open: true,
+            tab: 1,
+            custom: true,
+            capture: None,
+            notice,
+        };
+        self.draw();
+    }
+
     fn save(&self) {
         if let Err(e) = self.config.save(&Config::path()) {
             eprintln!("Could not save settings: {e}");
@@ -494,9 +743,13 @@ impl App {
     unsafe fn press(&mut self, button: u32, p: Point) {
         self.cursor = p;
         self.place_bar();
+        if self.capture.take().is_some() {
+            XUngrabKeyboard(self.display, 0);
+        }
         if button == 4 || button == 5 {
+            self.config.custom_enabled = false;
             self.config.style = (self.config.style + if button == 4 { 36 } else { 1 }) % 37;
-            if let Err(e) = self.renderer.select(self.config.style) {
+            if let Err(e) = self.renderer.select_config(&self.config) {
                 eprintln!("{e}");
             }
             self.save();
@@ -506,11 +759,16 @@ impl App {
         if button != 1 && button != 3 {
             return;
         }
+        if self.settings_hit(p) {
+            self.draw();
+            return;
+        }
         if let Some(i) = self.bar_hit(p) {
             match i {
                 0 | 1 => {
+                    self.config.custom_enabled = false;
                     self.config.style = (self.config.style + if i == 0 { 36 } else { 1 }) % 37;
-                    if let Err(e) = self.renderer.select(self.config.style) {
+                    if let Err(e) = self.renderer.select_config(&self.config) {
                         eprintln!("{e}");
                     }
                     self.save();
@@ -523,7 +781,7 @@ impl App {
                     } else {
                         0
                     };
-                    self.settings = false;
+                    self.settings.open = false;
                 }
                 3 => {
                     self.config.sound = !self.config.sound;
@@ -531,15 +789,15 @@ impl App {
                 }
                 4 => self.ink.clear(),
                 5 => {
-                    self.settings = !self.settings;
+                    self.settings.open = !self.settings.open;
                     self.page = 0;
                 }
                 6 => self.deactivate(),
                 _ => {}
             }
-        } else if self.settings_hit(p) {
         } else if let Some(style) = self.grid_hit(p) {
             self.config.style = style;
+            self.config.custom_enabled = false;
             if let Err(e) = self.renderer.select(style) {
                 eprintln!("{e}");
             }
@@ -547,13 +805,17 @@ impl App {
             self.save();
         } else {
             self.page = 0;
-            if self.settings {
-                self.settings = false;
+            if self.settings.open {
+                self.settings.open = false;
             } else {
                 self.ink.down(p);
                 self.pressed = Some(Instant::now());
-                if self.config.sound {
-                    self.sound.tap(self.config.volume);
+                if self.config.sound
+                    && (self.config.style != 36
+                        || self.config.custom_enabled
+                        || self.config.laser_sound)
+                {
+                    self.sound.tap(self.config.volume, self.config.sound_kind);
                 }
             }
         }
@@ -632,7 +894,7 @@ impl App {
                             eprintln!("{err}");
                         }
                     }
-                    self.settings = true;
+                    self.settings.open = true;
                     self.page = 0;
                     self.draw();
                 }
@@ -670,7 +932,10 @@ impl App {
                 self.draw();
             }
             12 if e.button.window == self.tray => self.paint_tray(),
-            12 if self.active => self.draw(),
+            12 if self.active => {
+                self.renderer.invalidate();
+                self.draw();
+            }
             22 => {
                 let c = e.configure;
                 if c.window == self.root
@@ -697,38 +962,84 @@ impl App {
         self.activate()?;
         let fd = XConnectionNumber(self.display);
         while !self.quit && !STOP.load(Ordering::SeqCst) {
-            while XPending(self.display) > 0 {
+            self.poll_import();
+            let batch_start = Instant::now();
+            let mut events = 0;
+            while XPending(self.display) > 0
+                && events < 256
+                && batch_start.elapsed() < Duration::from_millis(5)
+            {
                 let mut event = XEvent::default();
                 XNextEvent(self.display, &mut event);
                 self.handle(event);
+                events += 1;
             }
             let now = Instant::now();
             if now.duration_since(self.last_monitor_check) > Duration::from_secs(2) {
+                let before = (
+                    self.renderer.bar_x,
+                    self.renderer.bar_y,
+                    self.renderer.ui_scale,
+                    self.renderer.monitor_h,
+                );
                 self.refresh_monitors();
                 self.last_monitor_check = now;
-                self.draw();
+                if before
+                    != (
+                        self.renderer.bar_x,
+                        self.renderer.bar_y,
+                        self.renderer.ui_scale,
+                        self.renderer.monitor_h,
+                    )
+                {
+                    self.draw();
+                }
             }
             let old = self.ink.strokes.len();
             self.ink
                 .prune(now, Duration::from_secs_f64(self.config.fade));
+            if self
+                .pressed
+                .is_some_and(|t| now.duration_since(t) >= Duration::from_millis(300))
+            {
+                self.pressed = None;
+                self.draw();
+            }
             if !self.docked && now.duration_since(self.last_dock) > Duration::from_secs(2) {
                 self.dock_tray();
             }
             let animating = self.active
-                && (self.ink.is_drawing()
-                    || !self.ink.strokes.is_empty()
+                && (self.ink.strokes.iter().any(|s| s.released.is_some())
                     || self
                         .pressed
                         .is_some_and(|t| now.duration_since(t) < Duration::from_millis(300)));
-            if self.active && (animating || old != self.ink.strokes.len()) {
+            if self.active
+                && (old != self.ink.strokes.len()
+                    || (animating
+                        && now.duration_since(self.last_render) >= Duration::from_millis(33)))
+            {
                 self.draw();
             }
+            let elapsed = now.duration_since(self.last_render);
+            if self.redraw_pending && (events == 0 || elapsed >= Duration::from_millis(16)) {
+                self.render(now);
+            }
+            if XPending(self.display) > 0 {
+                continue;
+            }
+            let wait = if self.redraw_pending {
+                16_u64.saturating_sub(self.last_render.elapsed().as_millis() as u64)
+            } else if animating {
+                33_u64.saturating_sub(self.last_render.elapsed().as_millis() as u64)
+            } else {
+                500
+            };
             let mut pfd = PollFd {
                 fd,
                 events: 1,
                 revents: 0,
             };
-            poll(&mut pfd, 1, if animating { 33 } else { 500 });
+            poll(&mut pfd, 1, wait.min(500) as i32);
         }
         Ok(())
     }
@@ -739,13 +1050,13 @@ impl Drop for App {
         unsafe {
             self.deactivate();
             self.unregister_keys();
-            // The renderer must release its Xlib surface before the connection closes.
-            // It is held until struct teardown, so explicitly flush before destroying the drawable.
-            cairo_surface_flush(self.renderer.surface);
-            cairo_surface_destroy(self.renderer.surface);
-            self.renderer.surface = ptr::null_mut();
+            XSync(self.display, 0);
+            std::thread::sleep(Duration::from_millis(100));
+            self.renderer.release_x11();
             XDestroyWindow(self.display, self.window);
-            XDestroyWindow(self.display, self.tray);
+            if self.tray != 0 {
+                XDestroyWindow(self.display, self.tray);
+            }
             XFreeCursor(self.display, self.invisible);
             XFreeColormap(self.display, self.cmap);
             XCloseDisplay(self.display);
@@ -762,5 +1073,22 @@ fn main() {
     if let Err(e) = result {
         eprintln!("tinyhand-rs: {e}");
         std::process::exit(1);
+    }
+}
+
+#[cfg(test)]
+mod safety_tests {
+    use super::{is_cinnamon_desktop, is_muffin_name};
+
+    #[test]
+    fn cinnamon_and_muffin_names_disable_the_legacy_tray() {
+        assert!(is_cinnamon_desktop("X-Cinnamon", ""));
+        assert!(is_cinnamon_desktop("GNOME:Cinnamon", ""));
+        assert!(is_cinnamon_desktop("", "cinnamon"));
+        assert!(!is_cinnamon_desktop("XFCE", "xfce"));
+        assert!(is_muffin_name("Mutter (Muffin)"));
+        assert!(is_muffin_name("Cinnamon"));
+        assert!(!is_muffin_name("Mutter"));
+        assert!(!is_muffin_name("Xfwm4"));
     }
 }

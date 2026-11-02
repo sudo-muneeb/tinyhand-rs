@@ -284,11 +284,52 @@ extern "C" {
         y: c_uint,
     ) -> Cursor;
     pub fn XFreePixmap(d: *mut Display, p: Pixmap) -> c_int;
+    pub fn XCreatePixmap(
+        d: *mut Display,
+        drawable: Drawable,
+        width: c_uint,
+        height: c_uint,
+        depth: c_uint,
+    ) -> Pixmap;
+    pub fn XCreateGC(
+        d: *mut Display,
+        drawable: Drawable,
+        mask: c_ulong,
+        values: *mut c_void,
+    ) -> *mut c_void;
+    pub fn XFreeGC(d: *mut Display, gc: *mut c_void) -> c_int;
+    pub fn XSetGraphicsExposures(d: *mut Display, gc: *mut c_void, enabled: c_int) -> c_int;
+    pub fn XCopyArea(
+        d: *mut Display,
+        source: Drawable,
+        destination: Drawable,
+        gc: *mut c_void,
+        source_x: c_int,
+        source_y: c_int,
+        width: c_uint,
+        height: c_uint,
+        dest_x: c_int,
+        dest_y: c_int,
+    ) -> c_int;
     pub fn XFree(data: *mut c_void) -> c_int;
     pub fn XFreeCursor(d: *mut Display, c: Cursor) -> c_int;
     pub fn XStoreName(d: *mut Display, w: Window, name: *const c_char) -> c_int;
     pub fn XInternAtom(d: *mut Display, name: *const c_char, only: c_int) -> c_ulong;
     pub fn XGetSelectionOwner(d: *mut Display, selection: c_ulong) -> Window;
+    pub fn XGetWindowProperty(
+        d: *mut Display,
+        w: Window,
+        property: c_ulong,
+        offset: c_long,
+        length: c_long,
+        delete: c_int,
+        req_type: c_ulong,
+        actual_type: *mut c_ulong,
+        actual_format: *mut c_int,
+        nitems: *mut c_ulong,
+        bytes_after: *mut c_ulong,
+        data: *mut *mut u8,
+    ) -> c_int;
     pub fn XSendEvent(
         d: *mut Display,
         w: Window,
@@ -408,8 +449,10 @@ extern "C" {
     pub fn cairo_set_source_surface(c: *mut Cairo, s: *mut Surface, x: c_double, y: c_double);
     pub fn cairo_paint(c: *mut Cairo);
     pub fn cairo_paint_with_alpha(c: *mut Cairo, a: c_double);
+    pub fn cairo_mask_surface(c: *mut Cairo, surface: *mut Surface, x: c_double, y: c_double);
     pub fn cairo_move_to(c: *mut Cairo, x: c_double, y: c_double);
     pub fn cairo_new_path(c: *mut Cairo);
+    pub fn cairo_clip(c: *mut Cairo);
     pub fn cairo_close_path(c: *mut Cairo);
     pub fn cairo_line_to(c: *mut Cairo, x: c_double, y: c_double);
     pub fn cairo_stroke(c: *mut Cairo);

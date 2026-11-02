@@ -21,6 +21,13 @@ pub struct Config {
     pub startup: bool,
     pub toggle: String,
     pub clear: String,
+    pub angle: f64,
+    pub opacity: f64,
+    pub shadow: bool,
+    pub sound_kind: usize,
+    pub laser_sound: bool,
+    pub custom_path: String,
+    pub custom_enabled: bool,
 }
 
 impl Default for Config {
@@ -36,6 +43,13 @@ impl Default for Config {
             startup: false,
             toggle: "Control+Alt+h".into(),
             clear: "Control+Alt+x".into(),
+            angle: -0.16,
+            opacity: 1.0,
+            shadow: true,
+            sound_kind: 1,
+            laser_sound: false,
+            custom_path: String::new(),
+            custom_enabled: false,
         }
     }
 }
@@ -67,6 +81,13 @@ impl Config {
                     "startup" => c.startup = v == "true",
                     "toggle" if valid_shortcut(v) => c.toggle = v.into(),
                     "clear" if valid_shortcut(v) => c.clear = v.into(),
+                    "angle" => c.angle = num(v, c.angle, -1.2, 1.2),
+                    "opacity" => c.opacity = num(v, c.opacity, 0.2, 1.0),
+                    "shadow" => c.shadow = v == "true",
+                    "sound_kind" => c.sound_kind = v.parse::<usize>().unwrap_or(1).min(6),
+                    "laser_sound" => c.laser_sound = v == "true",
+                    "custom_path" => c.custom_path = v.into(),
+                    "custom_enabled" => c.custom_enabled = v == "true",
                     _ => {}
                 }
             }
@@ -78,9 +99,13 @@ impl Config {
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;
         }
-        let s = format!("style={}\nsize={}\nthickness={}\ncolor={}\nfade={}\nsound={}\nvolume={}\nstartup={}\ntoggle={}\nclear={}\n",
+        let mut s = format!("style={}\nsize={}\nthickness={}\ncolor={}\nfade={}\nsound={}\nvolume={}\nstartup={}\ntoggle={}\nclear={}\n",
             STYLES[self.style], self.size, self.thickness, self.color, self.fade,
             self.sound, self.volume, self.startup, self.toggle, self.clear);
+        s.push_str(&format!("angle={}\nopacity={}\nsound_kind={}\nlaser_sound={}\ncustom_path={}\ncustom_enabled={}\n",
+            self.angle, self.opacity, self.sound_kind, self.laser_sound,
+            self.custom_path.replace(['\n', '\r'], ""), self.custom_enabled));
+        s.push_str(&format!("shadow={}\n", self.shadow));
         let temp = path.with_extension("tmp");
         fs::write(&temp, s)?;
         fs::rename(temp, path)

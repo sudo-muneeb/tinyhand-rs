@@ -53,9 +53,12 @@ impl Ink {
                 if stroke
                     .points
                     .last()
-                    .is_some_and(|last| last.distance(p) > 0.5)
+                    .is_some_and(|last| last.distance(p) > 2.0)
                 {
                     stroke.points.push(p);
+                    if stroke.points.len() > 8192 {
+                        stroke.points = stroke.points.iter().step_by(2).copied().collect();
+                    }
                 }
             }
         }
@@ -77,7 +80,7 @@ impl Ink {
     pub fn prune(&mut self, now: Instant, fade: Duration) {
         self.strokes.retain(|s| {
             s.released
-                .map_or(true, |t| now.saturating_duration_since(t) < fade)
+                .is_none_or(|t| now.saturating_duration_since(t) < fade)
         });
     }
     pub fn is_drawing(&self) -> bool {

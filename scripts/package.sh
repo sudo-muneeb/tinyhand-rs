@@ -15,22 +15,23 @@ cp assets/icons/tinyhand-rs.svg "$stage/usr/share/icons/hicolor/scalable/apps/"
 cp README.md NOTICE.md LICENSE BUILD_REPORT.md "$stage/usr/share/doc/tinyhand-rs/"
 cat > "$stage/DEBIAN/control" <<'EOF'
 Package: tinyhand-rs
-Version: 0.1.0
+Version: 0.1.3
 Section: utils
 Priority: optional
 Architecture: amd64
 Maintainer: TinyHand for Linux contributors
 Depends: libc6 (>= 2.34), libx11-6, libxext6, libxrender1, libxinerama1, libcairo2, libasound2
+Recommends: zenity
 Description: Native X11 presentation pointer with fading ink
  36 hand styles and a laser dot, tap sounds, drawing and global shortcuts.
 EOF
-dpkg-deb --build --root-owner-group "$stage" dist/tinyhand-rs_0.1.0_amd64.deb
-portable="dist/tinyhand-rs-0.1.0-linux-x86_64"
+dpkg-deb --build --root-owner-group "$stage" dist/tinyhand-rs_0.1.3_amd64.deb
+portable="dist/tinyhand-rs-0.1.3-linux-x86_64"
 rm -rf "$portable"
 mkdir -p "$portable"
 cp target/release/tinyhand-rs README.md NOTICE.md LICENSE BUILD_REPORT.md tinyhand-rs.desktop "$portable/"
 cp -R assets "$portable/"
-tar -C dist -czf dist/tinyhand-rs-0.1.0-linux-x86_64.tar.gz "$(basename "$portable")"
-tar --exclude=target --exclude=dist -czf dist/tinyhand-rs-0.1.0-source.tar.gz \
-  --transform='s,^,tinyhand-rs-0.1.0/,' .
+tar -C dist -czf dist/tinyhand-rs-0.1.3-linux-x86_64.tar.gz "$(basename "$portable")"
+tar --exclude=target --exclude=dist -czf dist/tinyhand-rs-0.1.3-source.tar.gz \
+  --transform='s,^,tinyhand-rs-0.1.3/,' .
 rm -rf "$stage" "$portable"

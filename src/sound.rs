@@ -1,5 +1,5 @@
 use std::ffi::{c_char, c_int, c_uint, c_ulong, c_void};
-use std::sync::mpsc::{self, Sender};
+use std::sync::mpsc::{self, SyncSender};
 use std::thread;
 
 #[link(name = "asound")]
@@ -20,7 +20,7 @@ extern "C" {
 }
 
 pub struct Sound {
-    tx: Sender<f64>,
+    tx: SyncSender<(f64, usize)>,
 }
 impl Default for Sound {
     fn default() -> Self {
@@ -29,20 +29,17 @@ impl Default for Sound {
 }
 impl Sound {
     pub fn new() -> Self {
-        let (tx, rx) = mpsc::channel::<f64>();
+        let (tx, rx) = mpsc::sync_channel::<(f64, usize)>(4);
         thread::spawn(move || {
-            // The original sample is PCM, mono, 16-bit, 44100 Hz.
-            let wav = include_bytes!("../assets/sounds/tap_thock.wav");
-            let samples = wav
-                .chunks_exact(2)
-                .skip(22)
-                .map(|b| i16::from_le_bytes([b[0], b[1]]))
-                .collect::<Vec<_>>();
+            let samples = WAVS.iter().map(|wav| decode_wav(wav)).collect::<Vec<_>>();
             let mut pcm: *mut c_void = std::ptr::null_mut();
-            for volume in rx {
+            for (volume, kind) in rx {
+                let Some(samples) = samples.get(kind.saturating_sub(1)) else {
+                    continue;
+                };
                 unsafe {
                     if pcm.is_null() {
-                        if snd_pcm_open(&mut pcm, b"default\0".as_ptr().cast(), 0, 0) < 0 {
+                        if snd_pcm_open(&mut pcm, c"default".as_ptr(), 0, 0) < 0 {
                             pcm = std::ptr::null_mut();
                             continue;
                         }
@@ -84,7 +81,52 @@ impl Sound {
         });
         Self { tx }
     }
-    pub fn tap(&self, volume: f64) {
-        let _ = self.tx.send(volume);
+    pub fn tap(&self, volume: f64, kind: usize) {
+        if kind > 0 {
+            let _ = self.tx.try_send((volume, kind));
+        }
+    }
+}
+
+const WAVS: [&[u8]; 6] = [
+    include_bytes!("../assets/sounds/tap_thock.wav"),
+    include_bytes!("../assets/sounds/tap_click.wav"),
+    include_bytes!("../assets/sounds/tap_pop.wav"),
+    include_bytes!("../assets/sounds/tap_wood.wav"),
+    include_bytes!("../assets/sounds/tap_boop.wav"),
+    include_bytes!("../assets/sounds/tap_squeak.wav"),
+];
+
+fn decode_wav(wav: &[u8]) -> Vec<i16> {
+    let mut offset = 12;
+    while offset + 8 <= wav.len() {
+        let length = u32::from_le_bytes(wav[offset + 4..offset + 8].try_into().unwrap()) as usize;
+        let start = offset + 8;
+        let Some(end) = start.checked_add(length).filter(|end| *end <= wav.len()) else {
+            break;
+        };
+        if &wav[offset..offset + 4] == b"data" {
+            return wav[start..end]
+                .as_chunks::<2>()
+                .0
+                .iter()
+                .map(|b| i16::from_le_bytes(*b))
+                .collect();
+        }
+        offset = end + length % 2;
+    }
+    Vec::new()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn original_sound_choices_have_pcm_audio() {
+        for wav in WAVS {
+            let pcm = decode_wav(wav);
+            assert!(!pcm.is_empty());
+            assert!(pcm.iter().any(|s| *s != 0));
+        }
     }
 }

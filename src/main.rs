@@ -501,6 +501,7 @@ impl App {
             return;
         }
         self.active = false;
+        self.renderer.reset_motion();
         self.redraw_pending = false;
         self.pressed = None;
         self.ink.end(Instant::now());
@@ -759,6 +760,8 @@ impl App {
         if button != 1 && button != 3 {
             return;
         }
+        self.ink.end(Instant::now());
+        self.renderer.pointer_down();
         if self.settings_hit(p) {
             self.draw();
             return;
@@ -913,6 +916,9 @@ impl App {
             5 if self.active => {
                 let b = e.button;
                 self.ink.end(Instant::now());
+                if e.button.button == 1 || e.button.button == 3 {
+                    self.renderer.pointer_up();
+                }
                 self.cursor = Point {
                     x: b.x_root as f64,
                     y: b.y_root as f64,
@@ -928,7 +934,11 @@ impl App {
                 };
                 self.cursor = p;
                 self.place_bar();
-                self.ink.move_to(p);
+                if m.state & ((1 << 8) | (1 << 10)) != 0 {
+                    self.ink.move_to(p);
+                } else {
+                    self.ink.end(Instant::now());
+                }
                 self.draw();
             }
             12 if e.button.window == self.tray => self.paint_tray(),
@@ -1009,14 +1019,21 @@ impl App {
                 self.dock_tray();
             }
             let animating = self.active
-                && (self.ink.strokes.iter().any(|s| s.released.is_some())
+                && (self.renderer.motion_animating()
+                    || self.ink.strokes.iter().any(|s| s.released.is_some())
                     || self
                         .pressed
                         .is_some_and(|t| now.duration_since(t) < Duration::from_millis(300)));
+            let animation_interval = if self.renderer.motion_animating() {
+                16
+            } else {
+                33
+            };
             if self.active
                 && (old != self.ink.strokes.len()
                     || (animating
-                        && now.duration_since(self.last_render) >= Duration::from_millis(33)))
+                        && now.duration_since(self.last_render)
+                            >= Duration::from_millis(animation_interval)))
             {
                 self.draw();
             }
@@ -1030,7 +1047,7 @@ impl App {
             let wait = if self.redraw_pending {
                 16_u64.saturating_sub(self.last_render.elapsed().as_millis() as u64)
             } else if animating {
-                33_u64.saturating_sub(self.last_render.elapsed().as_millis() as u64)
+                animation_interval.saturating_sub(self.last_render.elapsed().as_millis() as u64)
             } else {
                 500
             };

@@ -43,7 +43,7 @@ impl Default for Config {
             startup: false,
             toggle: "Control+Alt+h".into(),
             clear: "Control+Alt+x".into(),
-            angle: -0.16,
+            angle: 0.0,
             opacity: 1.0,
             shadow: true,
             sound_kind: 1,

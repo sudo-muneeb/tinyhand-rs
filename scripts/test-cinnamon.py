@@ -16,7 +16,7 @@ import signal
 import subprocess
 import tempfile
 import time
-from PIL import Image
+from PIL import Image, ImageChops
 
 
 def main():
@@ -107,7 +107,7 @@ def main():
         time.sleep(5)
         config = Path(env["XDG_CONFIG_HOME"]) / "tinyhand-rs/settings.conf"
         config.parent.mkdir()
-        config.write_text("sound=false\n")
+        config.write_text("sound=false\nstyle=laser\n")
         probe = start(["stdbuf", "-oL", "xev", "-name", "TinyHand input probe",
                        "-geometry", "240x140+20+20", "-event", "button"], "input")
         time.sleep(1)
@@ -123,6 +123,19 @@ def main():
             before = clicks()
             click()
             assert clicks() == before, "Active overlay leaked a click"
+            if cycle == 0:
+                # With the laser, this region contains neither the pointer nor
+                # its rod. A tap must not draw a line from toolbar text to it.
+                run("xdotool", "mousemove", "160", "180")
+                time.sleep(.35)
+                run("import", "-window", "root", str(output / "tap-before.png"))
+                run("xdotool", "mousedown", "1")
+                time.sleep(.05)
+                run("import", "-window", "root", str(output / "tap-down.png"))
+                run("xdotool", "mouseup", "1")
+                before_tap = Image.open(output / "tap-before.png").convert("RGB").crop((500,430,650,620))
+                after_tap = Image.open(output / "tap-down.png").convert("RGB").crop((500,430,650,620))
+                assert ImageChops.difference(before_tap,after_tap).getbbox() is None, "A tap left a stray line toward the toolbar"
             moves = ["xdotool", "mousemove", "300", "220", "mousedown", "1"]
             for i in range(100):
                 moves += ["mousemove", str(300 + i * 6), str(220 + i % 35 * 5),

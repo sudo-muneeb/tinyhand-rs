@@ -2,7 +2,9 @@ use crate::config::{Config, STYLES};
 use crate::ffi::*;
 use crate::ink::{Ink, Point};
 use crate::settings::{self, SettingsUi};
+mod hand;
 mod settings_panel;
+use crate::motion::{HandGeometry, HandMotion, HandPose};
 use std::ffi::CString;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -95,6 +97,9 @@ pub struct Renderer {
     pub settings_scale: f64,
     previews: Vec<*mut Surface>,
     custom_loaded: String,
+    geometry: HandGeometry,
+    motion: HandMotion,
+    monitor: (i32, i32, i32, i32),
 }
 
 impl Renderer {
@@ -153,6 +158,9 @@ impl Renderer {
             settings_scale: 1.0,
             previews: Vec::new(),
             custom_loaded: String::new(),
+            geometry: HandGeometry::default(),
+            motion: HandMotion::default(),
+            monitor: (0, 0, width, height),
         };
         this.select(style)?;
         Ok(this)
@@ -175,7 +183,8 @@ impl Renderer {
             if cairo_surface_status(self.hand) != 0 {
                 return Err(format!("Could not load {}", path.display()));
             }
-            self.tip = measure_tip(self.hand);
+            self.geometry = hand::measure_hand(self.hand);
+            self.tip = self.geometry.tip;
         }
         self.loaded = style;
         Ok(())
@@ -217,7 +226,8 @@ impl Renderer {
             cairo_surface_destroy(self.hand);
         }
         self.hand = hand;
-        self.tip = measure_tip(hand);
+        self.geometry = hand::measure_hand(hand);
+        self.tip = self.geometry.tip;
         self.loaded = 37;
         self.custom_loaded = config.custom_path.clone();
         self.invalidate();
@@ -241,11 +251,25 @@ impl Renderer {
         self.invalidate();
     }
 
+    pub fn pointer_down(&mut self) {
+        self.motion.press();
+    }
+    pub fn pointer_up(&mut self) {
+        self.motion.release();
+    }
+    pub fn reset_motion(&mut self) {
+        self.motion.reset();
+    }
+    pub fn motion_animating(&self) -> bool {
+        self.motion.is_animating()
+    }
+
     pub fn invalidate(&mut self) {
         self.last_frame = None;
     }
 
     pub fn place_bar(&mut self, monitor: (i32, i32, i32, i32)) {
+        self.monitor = monitor;
         let (x, y, w, h) = monitor;
         self.ui_scale = self
             .requested_scale
@@ -278,7 +302,18 @@ impl Renderer {
         pressed: Option<Instant>,
         now: Instant,
     ) {
-        let pointer = self.pointer_bounds(config, cursor);
+        let laser = config.style == 36 && !config.custom_enabled;
+        let (grip, press) = self.motion.advance(cursor, self.monitor, now, !laser);
+        let pose = HandPose::new(
+            self.geometry,
+            cursor,
+            grip,
+            self.monitor_h,
+            config.size,
+            config.angle,
+            press,
+        );
+        let pointer = self.hand_bounds(config, cursor, pose);
         let ink_bounds = ink_bounds(ink, config.thickness);
         let ui_bounds = self.ui_bounds(ui);
         let mut damage = Rect {
@@ -353,6 +388,7 @@ impl Renderer {
             (1.0 - now.saturating_duration_since(t).as_secs_f64() / 0.28).max(0.0)
         });
         if pulse > 0.0 {
+            cairo_new_path(c);
             cairo_set_source_rgba(c, r, g, b, pulse * 0.55);
             cairo_set_line_width(c, 2.5);
             cairo_arc(
@@ -367,12 +403,22 @@ impl Renderer {
         }
         if config.style == 36 && !config.custom_enabled {
             cairo_set_source_rgba(c, 1.0, 0.2, 0.15, 0.22);
+            cairo_new_path(c);
             cairo_arc(c, cursor.x, cursor.y, 20.0, 0.0, std::f64::consts::TAU);
             cairo_fill(c);
             cairo_set_source_rgba(c, 1.0, 0.2, 0.15, 1.0);
-            cairo_arc(c, cursor.x, cursor.y, 7.5, 0.0, std::f64::consts::TAU);
+            cairo_new_path(c);
+            cairo_arc(
+                c,
+                cursor.x,
+                cursor.y,
+                7.5 * (1.0 + 0.2 * press),
+                0.0,
+                std::f64::consts::TAU,
+            );
             cairo_fill(c);
             cairo_set_source_rgba(c, 1.0, 0.85, 0.8, 1.0);
+            cairo_new_path(c);
             cairo_arc(
                 c,
                 cursor.x - 1.5,
@@ -383,28 +429,7 @@ impl Renderer {
             );
             cairo_fill(c);
         } else if !self.hand.is_null() {
-            let ih = cairo_image_surface_get_height(self.hand) as f64;
-            let target = (config.size * self.monitor_h).clamp(45.0, 250.0);
-            let scale = target / (ih * 0.48);
-            cairo_save(c);
-            cairo_translate(c, cursor.x, cursor.y);
-            // Artwork's index finger is at the top, slightly left of the rod.
-            cairo_rotate(c, config.angle);
-            cairo_scale(c, scale, scale);
-            if config.shadow {
-                cairo_set_source_rgba(c, 0.0, 0.0, 0.0, 0.10 * config.opacity);
-                for offset in [3.0, 5.0, 7.0] {
-                    cairo_mask_surface(
-                        c,
-                        self.hand,
-                        -self.tip.x + offset / scale,
-                        -self.tip.y + offset / scale,
-                    );
-                }
-            }
-            cairo_set_source_surface(c, self.hand, -self.tip.x, -self.tip.y);
-            cairo_paint_with_alpha(c, config.opacity);
-            cairo_restore(c);
+            self.paint_hand(c, config, cursor, pose);
         }
         cairo_destroy(c);
         if !self.display.is_null() {
@@ -466,30 +491,6 @@ impl Renderer {
             XFreeGC(self.display, self.gc);
             XFreePixmap(self.display, self.pixmap);
             self.display = std::ptr::null_mut();
-        }
-    }
-
-    fn pointer_bounds(&self, config: &Config, cursor: Point) -> Rect {
-        if (config.style == 36 && !config.custom_enabled) || self.hand.is_null() {
-            return Rect::around(cursor, 34.0);
-        }
-        unsafe {
-            let w = cairo_image_surface_get_width(self.hand) as f64;
-            let h = cairo_image_surface_get_height(self.hand) as f64;
-            let scale = (config.size * self.monitor_h).clamp(45.0, 250.0) / (h * 0.48);
-            let (sin, cos) = config.angle.sin_cos();
-            let mut bounds: Option<Rect> = None;
-            for (x, y) in [(0.0, 0.0), (w, 0.0), (0.0, h), (w, h)] {
-                let x = (x - self.tip.x) * scale;
-                let y = (y - self.tip.y) * scale;
-                let p = Point {
-                    x: cursor.x + x * cos - y * sin,
-                    y: cursor.y + x * sin + y * cos,
-                };
-                let corner = Rect::around(p, 12.0);
-                bounds = Some(bounds.map_or(corner, |r| r.union(corner)));
-            }
-            bounds.unwrap().union(Rect::around(cursor, 34.0))
         }
     }
 
@@ -585,43 +586,16 @@ fn ink_bounds(ink: &Ink, thickness: f64) -> Option<Rect> {
         })
 }
 
-unsafe fn measure_tip(surface: *mut Surface) -> Point {
-    cairo_surface_flush(surface);
-    let w = cairo_image_surface_get_width(surface) as usize;
-    let h = cairo_image_surface_get_height(surface) as usize;
-    let stride = cairo_image_surface_get_stride(surface) as usize;
-    let data = cairo_image_surface_get_data(surface);
-    if data.is_null() {
-        return Point {
-            x: w as f64 * 0.5,
-            y: 0.0,
-        };
-    }
-    for y in 0..h {
-        let xs = (0..w)
-            .filter(|&x| *data.add(y * stride + x * 4 + 3) > 128)
-            .collect::<Vec<_>>();
-        if !xs.is_empty() {
-            return Point {
-                x: (xs[0] + xs[xs.len() - 1]) as f64 / 2.0,
-                y: y as f64,
-            };
-        }
-    }
-    Point {
-        x: w as f64 * 0.5,
-        y: 0.0,
-    }
-}
-
 unsafe fn set_text(c: *mut Cairo, x: f64, y: f64, size: f64, s: &str) {
     cairo_set_source_rgba(c, 0.97, 0.96, 1.0, 1.0);
     cairo_select_font_face(c, c"Sans".as_ptr(), 0, 0);
     cairo_set_font_size(c, size);
+    cairo_new_path(c);
     cairo_move_to(c, x, y);
     if let Ok(t) = CString::new(s) {
         cairo_show_text(c, t.as_ptr());
     }
+    cairo_new_path(c);
 }
 
 unsafe fn rounded(c: *mut Cairo, x: f64, y: f64, w: f64, h: f64, r: f64) {
@@ -703,6 +677,9 @@ mod tests {
                 settings_scale: 1.0,
                 previews: Vec::new(),
                 custom_loaded: String::new(),
+                geometry: HandGeometry::default(),
+                motion: HandMotion::default(),
+                monitor: (0, 0, 800, 600),
             };
             r.select(0).unwrap();
             r.place_bar((0, 0, 800, 600));
@@ -857,6 +834,46 @@ mod tests {
                     before,
                     "partial repaint must not leave seams in settings"
                 );
+            }
+            let empty = Ink::new();
+            r.paint(
+                &config,
+                &empty,
+                Point { x: 160.0, y: 180.0 },
+                (SettingsUi::default(), 0),
+                Some(now),
+                now,
+            );
+            cairo_surface_flush(surface);
+            let stray = (330..440).any(|y| (330..460).any(|x| alpha(x, y) > 0));
+            assert!(
+                !stray,
+                "a tap circle must not connect to the last toolbar label"
+            );
+            // Keep comparable rest, press, and release images for visual QA.
+            r.select(0).unwrap();
+            r.reset_motion();
+            let hand = Config::default();
+            for (name, millis, down) in [
+                ("rest", 0, false),
+                ("pressed", 16, true),
+                ("released", 170, false),
+            ] {
+                if down {
+                    r.pointer_down();
+                } else {
+                    r.pointer_up();
+                }
+                r.paint(
+                    &hand,
+                    &empty,
+                    Point { x: 160.0, y: 180.0 },
+                    (SettingsUi::default(), 0),
+                    None,
+                    now + Duration::from_millis(millis),
+                );
+                let path = CString::new(format!("/tmp/tinyhand-tap-{name}.png")).unwrap();
+                assert_eq!(cairo_surface_write_to_png(surface, path.as_ptr()), 0);
             }
         }
     }

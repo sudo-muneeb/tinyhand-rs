@@ -3,6 +3,37 @@
 Updated on 2 November 2026 for Linux x86_64 with Rust 1.99.1.
 Original reference: `nilbuild/tinyhand` at commit `f243657`.
 
+## Version 0.1.4 hand motion and click artifacts
+
+The previous working version was committed as `3b36712` before these changes.
+Its commit is unsigned because the configured SSH signer waited on the key
+agent; no signing configuration was changed.
+
+The supplied video's tap sequence and upstream `ArmView.swift` were reviewed
+again. The hand and rod are now drawn as separate artwork segments. Measured
+tip/wrist/rod geometry keeps the fingertip on the cursor while the rod aims at
+a grip below the current monitor. Grip follow uses time-based easing with a
+0.20 second time constant. A press compresses the hand by 6% and lowers its
+shadow, then release eases back with a 0.084 second time constant. The laser
+core grows slightly on press. Idle rendering stops once motion settles;
+animation uses the existing approximately 60 FPS frame limit.
+
+Cairo click/laser arcs now start fresh paths, and text helpers clear their
+current paths. This prevents a circle from connecting to the previous toolbar
+label and producing a stray line or filled wedge. UI presses also end any
+previous ink gesture, and motion without a held drawing button ends ink.
+
+Eleven automated tests passed, including press/release settling, monitor-aware
+grip geometry, and checking transparency between a tap and the toolbar.
+Rest/press/release PNGs are written to `/tmp/tinyhand-tap-*.png` by the rendering
+test for visual comparison. The compositor regression also compares a remote
+screen region before and during a laser tap to detect stray lines.
+Three isolated Cinnamon cycles passed with the new motion, settings workflow,
+PNG chooser, and screenshot comparison. Idle app CPU returned to 0.0% in the
+short sample after settling; maximum sampled RSS was 37,272 KiB. Logs and
+screenshots are under `/tmp/tinyhand-cinnamon-8_r5hcgp/`. The live Cinnamon
+process remained unchanged; these new motion checks ran on a separate display.
+
 ## Version 0.1.3 settings update
 
 The upstream repository was downloaded to

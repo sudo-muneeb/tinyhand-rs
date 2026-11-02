@@ -430,10 +430,12 @@ unsafe fn text(c: *mut Cairo, x: f64, y: f64, size: f64, label: &str, bold: bool
     );
     cairo_select_font_face(c, c"Sans".as_ptr(), 0, i32::from(bold));
     cairo_set_font_size(c, size);
+    cairo_new_path(c);
     cairo_move_to(c, x, y);
     if let Ok(label) = CString::new(label) {
         cairo_show_text(c, label.as_ptr());
     }
+    cairo_new_path(c);
 }
 unsafe fn fill(c: *mut Cairo, r: (f64, f64, f64, f64), radius: f64, color: (f64, f64, f64, f64)) {
     if radius > 0.0 {

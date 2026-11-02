@@ -12,3 +12,5 @@ The Rust settings interface is adapted from the original `SettingsView.swift`
 and `SettingsWindow.swift` design, reviewed at commit
 `c5fb36b7c4d7c87480958872a724b30a52427a47`. Original Swift/AppKit code is not
 compiled into the Linux application.
+Hand geometry, grip follow, and press/release motion are adapted from
+`ArmView.swift` and `HandAsset` in `PointerStyle.swift` at the same commit.

@@ -3,7 +3,7 @@
 Native Rust and X11 presentation pointer inspired by [TinyHand](https://github.com/nilbuild/tinyhand).
 The original artwork and tap sample are included with attribution and their MIT license.
 
-**Cinnamon compatibility:** Version 0.1.3 disables the legacy XEmbed tray on
+**Cinnamon compatibility:** Version 0.1.4 disables the legacy XEmbed tray on
 Cinnamon/Muffin. The tray path reproduced the compositor crash in an isolated
 Cinnamon session, with the same stack trace as the earlier live crashes.
 Detection checks both desktop variables and the actual X11 window manager.
@@ -15,7 +15,7 @@ The former Cinnamon startup block and development override are no longer used.
 On a compatible Debian based x86_64 X11 desktop:
 
 ```sh
-sudo apt install ./tinyhand-rs_0.1.3_amd64.deb
+sudo apt install ./tinyhand-rs_0.1.4_amd64.deb
 ```
 
 Launch **TinyHand for Linux** in the application menu, or run `tinyhand-rs`.
@@ -32,6 +32,11 @@ Cinnamon normally provides one.
 
 The app starts in presentation mode. The hand follows the real pointer.
 The normal cursor is hidden while the X11 pointer grab is active.
+The hand aims toward a grip below the current monitor, with a gently following
+rod. Pressing compresses the hand and lowers its shadow; releasing lets it ease
+back to rest. The fingertip stays aligned with the actual pointer. Appearance's
+tilt control adds an angle offset to this natural aim. Animation stops when the
+grip and press motion have settled.
 
 | Action | Result |
 | --- | --- |

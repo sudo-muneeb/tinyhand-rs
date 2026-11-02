@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=TinyHand for Linux
+Comment=Presentation pointer, taps and fading ink
+Exec=tinyhand-rs
+Icon=tinyhand-rs
+Terminal=false
+Categories=Utility;Accessibility;
+StartupNotify=false

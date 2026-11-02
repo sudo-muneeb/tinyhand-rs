@@ -1,0 +1,12 @@
+[package]
+name = "tinyhand-rs"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "TinyHand presentation pointer for X11 Linux"
+
+[profile.release]
+strip = true
+lto = true
+codegen-units = 1
+

@@ -97,17 +97,27 @@ def main():
                 action('Sound')
                 for kind,title in enumerate(['Thock','Click','Pop','Wood block','Boop','Squeak'],1):
                     action(title);wait(lambda:f'sound_kind={kind}\n' in cfg.read_text(),f'{title} did not persist')
+                    assert find(title).getState().contains(pyatspi.STATE_CHECKED),f'{title} selection did not update'
                 action('Off');wait(lambda:'sound=false' in cfg.read_text(),'Sound off did not persist')
                 action('General')
                 shortcut=find('Turn the pointer on or off','text');assert shortcut.queryComponent().grabFocus();time.sleep(.15)
                 run('xdotool','key','ctrl+alt+x');time.sleep(.3)
                 assert 'toggle=Control+Alt+h' in cfg.read_text() and 'clear=Control+Alt+x' in cfg.read_text(),'Conflicting shortcut did not roll back'
+                recorder=find('Turn the pointer on or off','text');assert recorder.queryComponent().grabFocus();time.sleep(.1);run('xdotool','key','Tab');time.sleep(.1)
+                assert 'Press' not in recorder.queryText().getText(0,-1),'Leaving the shortcut recorder did not cancel recording'
+                run('xdotool','key','Escape')
                 action('Appearance');scale=find('Size','slider').queryValue();scale.currentValue=.16;wait(lambda:'size=0.16' in cfg.read_text(),'Size did not persist')
                 action('Drawing');action('Match');wait(lambda:'match_color=true' in cfg.read_text(),'Match colour did not persist')
                 # Selecting via the native pointer library also exercises persistence.
                 action('Pointers');action('Pin blue');action('Pin mint');action('Pin lemon');action('Replace lavender')
                 wait(lambda:'lemon' in cfg.read_text().split('pinned=')[1].splitlines()[0] and 'lavender' not in cfg.read_text().split('pinned=')[1].splitlines()[0],'Full-toolbar replacement failed')
                 action('Reset toolbar')
+                action('Use coral');wait(lambda:'style=coral' in cfg.read_text(),'Pointer selection did not persist')
+                action('Appearance');preview=find('Pointer preview');bounds=preview.queryComponent().getExtents(pyatspi.DESKTOP_COORDS);box=(bounds.x,bounds.y,bounds.x+bounds.width,bounds.y+bounds.height)
+                first=screenshot('appearance-hand').crop(box);find('Size','slider').queryValue().currentValue=.18;time.sleep(.2);second=screenshot('appearance-hand-adjusted').crop(box)
+                assert ImageChops.difference(first,second).getbbox() is not None,'The appearance preview did not update with the slider'
+                find('Size','slider').queryValue().currentValue=.16
+                action('Pointers');action('Use laser')
                 action('Pin lavender');wait(lambda:'pinned=glove,coral,plush,robot,laser' in cfg.read_text(),'Pin removal failed')
                 action('Pin lavender');wait(lambda:'lavender' in cfg.read_text().split('pinned=')[1].splitlines()[0],'Pin addition failed')
                 # Validate and compose hand-only artwork, then import through the native chooser.

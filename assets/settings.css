@@ -1,0 +1,65 @@
+/* Native GTK 3 settings, scoped to TinyHand's window. */
+window.tinyhand { background: #171719; color: #f2f2f5; }
+.tinyhand headerbar { background-image: none; background-color: #1d1d20; border: 0; border-bottom: 1px solid #303034; box-shadow: none; min-height: 42px; padding: 4px 10px; }
+.tinyhand headerbar .title { color: #eaeaf0; font-size: 12px; font-weight: 600; }
+.tinyhand label { color: #ededf2; }
+.tinyhand .muted { color: #a3a3ae; font-size: 11px; }
+.tinyhand .sidebar { background: #1d1d20; border-right: 1px solid #303034; padding: 22px 12px 12px; }
+.tinyhand .brand { padding: 0 8px 24px; }
+.tinyhand .brand-title { font-size: 17px; font-weight: 700; }
+.tinyhand .nav-section { color: #858590; font-size: 10px; font-weight: 600; padding: 0 10px 8px; }
+.tinyhand button { background-image: none; background-color: #2a2a2f; color: #dedee7; border: 1px solid #3b3b43; border-radius: 8px; padding: 7px 12px; box-shadow: none; text-shadow: none; }
+.tinyhand button label { color: inherit; }
+.tinyhand button:hover { background-color: #35353d; border-color: #53535d; }
+.tinyhand button:active { background-color: #232329; }
+.tinyhand button:focus { border-color: #b69af5; }
+.tinyhand button:disabled { color: #6e6e7a; background-color: #242428; border-color: #303035; }
+.tinyhand button.primary { background-color: #8754f2; border-color: #9669f6; color: white; font-weight: 600; padding: 9px 18px; }
+.tinyhand button.primary:hover { background-color: #9665fa; }
+.tinyhand button.quiet { background-color: transparent; border-color: transparent; color: #a3a3ae; }
+.tinyhand button.quiet:hover { background-color: #2a2a30; color: #eeeef5; }
+.tinyhand button.destructive { color: #f3a2a8; }
+.tinyhand .sidebar button.nav { background: transparent; border: 1px solid transparent; border-radius: 9px; padding: 10px; color: #a9a9b4; }
+.tinyhand .sidebar button.nav:hover { background: #27272d; color: #f0f0f6; }
+.tinyhand .sidebar button.nav:checked { background: #333039; border-color: #433b52; color: #e3d7ff; }
+.tinyhand .sidebar button.nav label { font-size: 12px; font-weight: 500; }
+.tinyhand .sidebar .version { color: #777783; font-size: 10px; padding: 8px; }
+.tinyhand .page { padding: 28px 30px 32px; }
+.tinyhand .heading { font-size: 25px; font-weight: 700; color: #f5f5f8; }
+.tinyhand .page-description { color: #a3a3ae; font-size: 12px; }
+.tinyhand .section { font-size: 12px; font-weight: 600; color: #ceced8; }
+.tinyhand .card { background: #222226; border: 1px solid #323238; border-radius: 13px; padding: 2px 16px; }
+.tinyhand .setting-row { padding: 13px 0; }
+.tinyhand .row-divider { background: #333339; min-height: 1px; border: 0; }
+.tinyhand .row-title { font-size: 12px; font-weight: 500; }
+.tinyhand .value-pill { color: #c7bbdf; background: #2c2934; border: 1px solid #40384e; border-radius: 7px; padding: 5px 7px; font-size: 11px; }
+.tinyhand entry { color: #ececf2; background: #1b1b1f; border: 1px solid #41414a; border-radius: 8px; min-height: 30px; padding: 4px 10px; box-shadow: none; }
+.tinyhand entry:focus { border-color: #a17af4; background: #23202c; }
+.tinyhand entry.shortcut { font-family: monospace; font-size: 11px; background: #2a2a30; }
+.tinyhand entry.recording { border-color: #c3a5ff; background: #31273f; color: #e6d6ff; }
+.tinyhand switch { min-width: 38px; min-height: 22px; background: #484850; border: 0; border-radius: 12px; }
+.tinyhand switch:checked { background: #8754f2; }
+.tinyhand switch slider { background: #f5f2fc; border: 0; border-radius: 11px; min-width: 18px; min-height: 18px; margin: 2px; box-shadow: 0 1px 2px alpha(black, 0.2); }
+.tinyhand scale trough { background: #45454f; min-height: 4px; border: 0; border-radius: 3px; }
+.tinyhand scale highlight { background: #ac87fb; border: 0; border-radius: 3px; }
+.tinyhand scale slider { min-width: 14px; min-height: 14px; background: #efebf8; border: 1px solid #ccc0df; box-shadow: 0 1px 3px alpha(black, 0.22); }
+.tinyhand .footer { background: #1b1b1e; border-top: 1px solid #303034; padding: 12px 20px; }
+.tinyhand button.pointer-tile { background: #25252a; border: 1px solid #383840; border-radius: 11px; padding: 7px; }
+.tinyhand button.pointer-tile:hover { background: #303037; border-color: #6d627e; }
+.tinyhand button.pointer-tile.pinned { background: #2d2935; border-color: #4d405f; }
+.tinyhand button.pointer-tile.selected { background: #372c48; border-color: #b493f4; }
+.tinyhand .pointer-name { font-size: 10px; color: #c3c3ce; }
+.tinyhand .pin-badge { color: #d8c1ff; background: #4b3869; border-radius: 7px; padding: 2px; }
+.tinyhand button.remove-pin { padding: 2px; min-width: 18px; min-height: 18px; border-radius: 6px; background: transparent; border-color: transparent; color: #80808f; }
+.tinyhand button.remove-pin:hover { color: #f2a1a9; background: #402a30; }
+.tinyhand button.sound-tile { min-width: 86px; min-height: 64px; padding: 12px 8px; background: #28282d; border: 1px solid #3c3c45; border-radius: 11px; color: #aaaab7; }
+.tinyhand button.sound-tile:checked { color: #e2d1ff; background: #392e4a; border-color: #b18aef; }
+.tinyhand button.sound-tile:hover { border-color: #9580b0; }
+.tinyhand button.swatch { min-width: 24px; min-height: 24px; padding: 4px; border-radius: 8px; }
+.tinyhand button.swatch:checked { background-color: #3b304c; border-color: #bb9af6; }
+.tinyhand .preview-stage { background: #1b1b1f; border: 1px solid #35353e; border-radius: 12px; }
+.tinyhand .preview { background: #29262f; border: 1px solid #4b4259; border-radius: 12px; padding: 12px; }
+.tinyhand expander { background: #222226; border: 1px solid #34343c; border-radius: 11px; padding: 14px; }
+.tinyhand expander title { font-size: 12px; font-weight: 600; }
+.tinyhand button.drop-zone { background: #202024; border: 1px dashed #665576; border-radius: 11px; color: #c4b2df; padding: 20px; }
+.tinyhand button.drop-zone:hover { background: #302839; border-color: #b390ed; }

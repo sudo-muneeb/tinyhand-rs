@@ -10,7 +10,7 @@ Linux Mint Cinnamon and other composited X11 desktops. It includes the original
 Install the Debian package, or extract the portable archive and run its binary:
 
 ```sh
-sudo apt install ./tinyhand-rs_0.2.1_amd64.deb
+sudo apt install ./tinyhand-rs_0.2.2_amd64.deb
 tinyhand-rs
 ```
 
@@ -51,7 +51,9 @@ tinyhand-rs --quit
 
 The six settings pages follow the original sidebar layout: General, Pointers,
 Appearance, Drawing, Sound and About. They use native, scrollable, resizable,
-keyboard-accessible GTK controls. Opening settings releases pointer capture.
+keyboard-accessible GTK controls. Appearance includes a live preview, pointer
+tiles show their names and toolbar badges, and slider values use readable units.
+Opening settings releases pointer capture.
 
 Ink matches the selected pointer by default; eight fixed colours are available.
 Each stroke keeps its own colour, thickness and fade preference. Choose a delay

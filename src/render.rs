@@ -4,6 +4,7 @@ use crate::ffi::*;
 use crate::ink::{Ink, Point};
 mod hand;
 mod thumbnails;
+mod toolbar_paint;
 use crate::motion::{HandGeometry, HandMotion, HandPose};
 use std::ffi::CString;
 use std::path::{Path, PathBuf};
@@ -34,6 +35,12 @@ impl Rect {
             (self.y + self.h).ceil() - y,
         );
     }
+    fn intersects(self, other: Self) -> bool {
+        self.x < other.x + other.w
+            && other.x < self.x + self.w
+            && self.y < other.y + other.h
+            && other.y < self.y + self.h
+    }
     fn around(p: Point, radius: f64) -> Self {
         Self {
             x: p.x - radius,
@@ -57,6 +64,12 @@ impl Rect {
 
 struct Frame {
     pointer: Rect,
+    cursor: Point,
+    pose: HandPose,
+    ink_revision: u64,
+    ink_id: usize,
+    ink_fading: bool,
+    hover: Option<crate::toolbar::Item>,
     ink: Option<Rect>,
     ui: Rect,
     config: Config,
@@ -66,18 +79,39 @@ struct Frame {
     hint: bool,
 }
 
+struct ToolbarCache {
+    image: *mut Surface,
+    config: Config,
+    page: usize,
+    hint: bool,
+    hover: Option<crate::toolbar::Item>,
+    scale: f64,
+    width: f64,
+}
+impl Drop for ToolbarCache {
+    fn drop(&mut self) {
+        unsafe {
+            cairo_surface_destroy(self.image);
+        }
+    }
+}
+
 pub struct Renderer {
     pub surface: *mut Surface,
     pub pointer_visible: bool,
     pub toolbar_alpha: f64,
     pub toolbar_width: f64,
     pub hint: bool,
+    pub hover: Option<crate::toolbar::Item>,
+    toolbar_cache: Option<ToolbarCache>,
     display: *mut Display,
     window: Window,
     pixmap: Pixmap,
     gc: *mut std::ffi::c_void,
     visual: *mut Visual,
     hand: *mut Surface,
+    shadow: *mut Surface,
+    shadow_scale: f64,
     detail: i32,
     tip: Point,
     pub width: i32,
@@ -128,12 +162,16 @@ impl Renderer {
             toolbar_alpha: 1.0,
             toolbar_width: 488.0,
             hint: false,
+            hover: None,
+            toolbar_cache: None,
             display,
             window,
             pixmap,
             gc,
             visual,
             hand: std::ptr::null_mut(),
+            shadow: std::ptr::null_mut(),
+            shadow_scale: 1.0,
             detail: 384,
             tip: Point { x: 0.0, y: 0.0 },
             width,
@@ -173,6 +211,10 @@ impl Renderer {
         if style == self.loaded {
             return Ok(());
         }
+        if !self.shadow.is_null() {
+            cairo_surface_destroy(self.shadow);
+            self.shadow = std::ptr::null_mut();
+        }
         if !self.hand.is_null() {
             cairo_surface_destroy(self.hand);
             self.hand = std::ptr::null_mut();
@@ -208,6 +250,7 @@ impl Renderer {
         }
         self.geometry = hand::measure_hand(self.hand);
         self.tip = self.geometry.tip;
+        self.prepare_shadow();
     }
 
     /// # Safety
@@ -355,9 +398,10 @@ impl Renderer {
             .requested_scale
             .min((bw as f64 - 16.0) / self.toolbar_width)
             .clamp(0.25, 3.0);
-        self.bar_x =
-            (bx as f64 + (bw as f64 - self.toolbar_width * self.ui_scale) / 2.0).max(bx as f64);
-        self.bar_y = (by + bh) as f64 - (8.0 + 54.0) * self.ui_scale;
+        self.bar_x = (bx as f64 + (bw as f64 - self.toolbar_width * self.ui_scale) / 2.0)
+            .max(bx as f64)
+            .round();
+        self.bar_y = ((by + bh) as f64 - (8.0 + 54.0) * self.ui_scale).round();
         self.monitor_h = h as f64;
     }
 
@@ -385,7 +429,11 @@ impl Renderer {
             press,
         );
         let pointer = self.hand_bounds(config, cursor, pose);
-        let ink_bounds = ink_bounds(ink);
+        let ink_bounds = self
+            .last_frame
+            .as_ref()
+            .filter(|f| f.ink_revision == ink.revision() && f.ink_id == ink as *const Ink as usize)
+            .map_or_else(|| ink_bounds(ink), |f| f.ink);
         let ui_bounds = self.ui_bounds(page);
         let mut damage = Rect {
             x: 0.0,
@@ -395,32 +443,38 @@ impl Renderer {
         };
         let c = cairo_create(self.surface);
         if let Some(previous) = &self.last_frame {
-            damage = previous.pointer.union(pointer);
-            cairo_new_path(c);
-            for rect in [
-                Some(previous.pointer),
-                Some(pointer),
-                previous.ink,
-                ink_bounds,
-            ]
-            .into_iter()
-            .flatten()
+            let mut regions = Vec::with_capacity(6);
+            if previous.cursor != cursor
+                || previous.pose != pose
+                || previous.config != *config
+                || previous.pointer_visible != self.pointer_visible
             {
-                damage = damage.union(rect);
-                rect.clip_path(c);
+                regions.extend([previous.pointer, pointer]);
             }
-            // Repaint both toolbar bounds when its geometry, palette or opacity changes.
+            if previous.ink_revision != ink.revision()
+                || previous.ink_id != ink as *const Ink as usize
+                || previous.ink_fading
+                || ink.needs_animation(now)
+            {
+                regions.extend([previous.ink, ink_bounds].into_iter().flatten());
+            }
             if previous.ui != ui_bounds
                 || previous.config != *config
                 || previous.page != page
                 || previous.toolbar_alpha != self.toolbar_alpha
-                || previous.pointer_visible != self.pointer_visible
                 || previous.hint != self.hint
+                || previous.hover != self.hover
             {
-                for rect in [previous.ui, ui_bounds] {
-                    damage = damage.union(rect);
-                    rect.clip_path(c);
-                }
+                regions.extend([previous.ui, ui_bounds]);
+            }
+            if regions.is_empty() {
+                cairo_destroy(c);
+                return;
+            }
+            damage = regions.iter().copied().reduce(Rect::union).unwrap();
+            cairo_new_path(c);
+            for rect in regions {
+                rect.clip_path(c);
             }
             cairo_clip(c);
         }
@@ -430,38 +484,29 @@ impl Renderer {
         cairo_set_line_cap(c, 1);
         cairo_set_line_join(c, 1);
         let (r, g, b) = self.ink_color(config);
-        for stroke in &ink.strokes {
-            if stroke.points.len() < 2 {
-                continue;
+        if ink_bounds.is_some_and(|bounds| bounds.intersects(damage)) {
+            for stroke in &ink.strokes {
+                if stroke.points.len() < 2 {
+                    continue;
+                }
+                let alpha = stroke.opacity(now);
+                cairo_save(c);
+                cairo_translate(c, 1.0, 1.5);
+                stroke_path(c, stroke);
+                cairo_set_source_rgba(c, 0.0, 0.0, 0.0, alpha * 0.16);
+                cairo_set_line_width(c, stroke.brush.width + 1.5);
+                cairo_stroke(c);
+                cairo_restore(c);
+                stroke_path(c, stroke);
+                let (sr, sg, sb) = stroke.brush.color;
+                cairo_set_source_rgba(c, sr, sg, sb, alpha);
+                cairo_set_line_width(c, stroke.brush.width);
+                cairo_stroke(c);
             }
-            let alpha = stroke.opacity(now);
-            cairo_save(c);
-            cairo_translate(c, 1.0, 1.5);
-            stroke_path(c, stroke);
-            cairo_set_source_rgba(c, 0.0, 0.0, 0.0, alpha * 0.16);
-            cairo_set_line_width(c, stroke.brush.width + 1.5);
-            cairo_stroke(c);
-            cairo_restore(c);
-            stroke_path(c, stroke);
-            let (sr, sg, sb) = stroke.brush.color;
-            cairo_set_source_rgba(c, sr, sg, sb, alpha);
-            cairo_set_line_width(c, stroke.brush.width);
-            cairo_stroke(c);
         }
-        cairo_save(c);
-        cairo_translate(c, self.bar_x, self.bar_y);
-        cairo_scale(c, self.ui_scale, self.ui_scale);
         if self.toolbar_alpha > 0.0 {
-            if self.toolbar_alpha >= 1.0 {
-                self.toolbar(c, config, page);
-            } else {
-                cairo_push_group(c);
-                self.toolbar(c, config, page);
-                cairo_pop_group_to_source(c);
-                cairo_paint_with_alpha(c, self.toolbar_alpha);
-            }
+            self.paint_toolbar_cache(c, config, page);
         }
-        cairo_restore(c);
         // The pointer and tap pulse are always the final layers, including
         // when their damage region intersects a toolbar or settings button.
         let _ = (pressed, r, g, b);
@@ -527,6 +572,12 @@ impl Renderer {
         }
         self.last_frame = Some(Frame {
             pointer,
+            cursor,
+            pose,
+            ink_revision: ink.revision(),
+            ink_id: ink as *const Ink as usize,
+            ink_fading: ink.needs_animation(now),
+            hover: self.hover.clone(),
             ink: ink_bounds,
             ui: ui_bounds,
             config: config.clone(),
@@ -541,6 +592,7 @@ impl Renderer {
     /// # Safety
     /// The display must still be live; call only on the rendering thread.
     pub unsafe fn release_x11(&mut self) {
+        self.toolbar_cache = None;
         if !self.surface.is_null() {
             cairo_surface_flush(self.surface);
             cairo_surface_destroy(self.surface);
@@ -553,6 +605,10 @@ impl Renderer {
             if !preview.is_null() {
                 cairo_surface_destroy(preview);
             }
+        }
+        if !self.shadow.is_null() {
+            cairo_surface_destroy(self.shadow);
+            self.shadow = std::ptr::null_mut();
         }
         if !self.hand.is_null() {
             cairo_surface_destroy(self.hand);
@@ -568,105 +624,10 @@ impl Renderer {
     fn ui_bounds(&self, page: usize) -> Rect {
         let top = if page > 0 || self.hint { -68.0 } else { 0.0 };
         Rect {
-            x: self.bar_x - 2.0,
-            y: self.bar_y + top * self.ui_scale - 2.0,
-            w: (self.toolbar_width + 4.0).max(370.0) * self.ui_scale,
-            h: (54.0 - top) * self.ui_scale + 4.0,
-        }
-    }
-
-    unsafe fn toolbar(&mut self, c: *mut Cairo, config: &Config, page: usize) {
-        use crate::toolbar::{self, Item};
-        rounded(c, 0.0, 0.0, self.toolbar_width, 54.0, 16.0);
-        cairo_set_source_rgba(c, 0.10, 0.11, 0.15, 0.94);
-        cairo_fill(c);
-        for (index, item) in toolbar::items(config).iter().enumerate() {
-            let x = 6.0 + index as f64 * 44.0;
-            if let Item::Pointer(id) = item {
-                if *id == config.selected_id() {
-                    rounded(c, x, 6.0, 42.0, 42.0, 10.0);
-                    cairo_set_source_rgba(c, 0.58, 0.4, 0.89, 0.45);
-                    cairo_fill(c);
-                }
-                if let Some(style) = STYLES.iter().position(|s| *s == id) {
-                    self.thumbnail(c, style, x + 4.0, 9.0, 34.0);
-                } else {
-                    self.custom_thumbnail(c, id, x + 4.0, 9.0, 34.0);
-                }
-            } else {
-                let text = match item {
-                    Item::Ink => "●",
-                    Item::Sound => {
-                        if config.tap_sound_enabled() {
-                            "♫"
-                        } else {
-                            "×♫"
-                        }
-                    }
-                    Item::Clear => "⌫",
-                    Item::Settings => "⚙",
-                    Item::Exit => "×",
-                    _ => "",
-                };
-                if matches!(item, Item::Ink) {
-                    let (r, g, b) = self.ink_color(config);
-                    cairo_set_source_rgba(c, r, g, b, 1.0);
-                    cairo_new_path(c);
-                    cairo_arc(c, x + 22.0, 27.0, 9.0, 0.0, std::f64::consts::TAU);
-                    cairo_fill(c);
-                } else {
-                    set_text(c, x + 12.0, 34.0, 20.0, text);
-                }
-            }
-        }
-        if page > 0 {
-            rounded(c, 0.0, -62.0, 366.0, 54.0, 14.0);
-            cairo_set_source_rgba(c, 0.10, 0.11, 0.15, 0.98);
-            cairo_fill(c);
-            for i in 0..9 {
-                let x = 23.0 + i as f64 * 40.0;
-                let selected = if i == 0 {
-                    config.match_color
-                } else {
-                    !config.match_color && config.color == colors::SWATCH_ORDER[i - 1]
-                };
-                if selected {
-                    cairo_set_source_rgba(c, 1.0, 1.0, 1.0, 0.75);
-                    cairo_set_line_width(c, 2.0);
-                    cairo_new_path(c);
-                    cairo_arc(c, x, -35.0, 14.0, 0.0, std::f64::consts::TAU);
-                    cairo_stroke(c);
-                }
-                let (r, g, b) = if i == 0 {
-                    self.ink_color(&Config {
-                        match_color: true,
-                        ..config.clone()
-                    })
-                } else {
-                    SWATCHES[colors::SWATCH_ORDER[i - 1]]
-                };
-                cairo_set_source_rgba(c, r, g, b, 1.0);
-                cairo_new_path(c);
-                cairo_arc(c, x, -35.0, 10.0, 0.0, std::f64::consts::TAU);
-                cairo_fill(c);
-                if i == 0 {
-                    set_text(c, x - 5.0, -31.0, 12.0, "↔");
-                }
-            }
-        } else if self.hint {
-            rounded(c, 0.0, -50.0, self.toolbar_width.max(350.0), 38.0, 12.0);
-            cairo_set_source_rgba(c, 0.10, 0.11, 0.15, 0.92);
-            cairo_fill(c);
-            set_text(
-                c,
-                12.0,
-                -26.0,
-                12.0,
-                &format!(
-                    "Drag to draw · Hold {} to interact · Esc to exit",
-                    config.interact_key
-                ),
-            );
+            x: self.bar_x - 8.0 * self.ui_scale,
+            y: self.bar_y + top * self.ui_scale - 8.0 * self.ui_scale,
+            w: (self.toolbar_width + 16.0).max(382.0) * self.ui_scale,
+            h: (70.0 - top) * self.ui_scale,
         }
     }
 }
@@ -786,12 +747,16 @@ mod tests {
                 toolbar_alpha: 1.0,
                 toolbar_width: 488.0,
                 hint: false,
+                hover: None,
+                toolbar_cache: None,
                 display: std::ptr::null_mut(),
                 window: 0,
                 pixmap: 0,
                 gc: std::ptr::null_mut(),
                 visual: std::ptr::null_mut(),
                 hand: std::ptr::null_mut(),
+                shadow: std::ptr::null_mut(),
+                shadow_scale: 1.0,
                 detail: 384,
                 tip: Point { x: 0.0, y: 0.0 },
                 width: 800,
@@ -949,6 +914,24 @@ mod tests {
             assert!(
                 *data.add(220 * stride + 150 * 4) > 200 && red(150, 220) < 70,
                 "the blue stroke must stay blue"
+            );
+            let ink_pixel =
+                std::slice::from_raw_parts(data.add(180 * stride + 150 * 4), 4).to_vec();
+            r.toolbar_alpha = 0.45;
+            r.paint(&fixed, &mixed, Point { x: 760.0, y: 30.0 }, 0, None, now);
+            cairo_surface_flush(surface);
+            assert_eq!(
+                std::slice::from_raw_parts(data.add(180 * stride + 150 * 4), 4),
+                ink_pixel,
+                "fading the toolbar must preserve stationary ink"
+            );
+            r.toolbar_alpha = 0.0;
+            r.paint(&fixed, &mixed, Point { x: 760.0, y: 30.0 }, 0, None, now);
+            cairo_surface_flush(surface);
+            assert_eq!(
+                alpha(400, 550),
+                0,
+                "the final fade frame must clear all toolbar pixels"
             );
         }
     }

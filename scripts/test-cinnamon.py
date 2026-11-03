@@ -161,6 +161,27 @@ def main():
             command('--clear');time.sleep(.2);baseline=screenshot('before-right-drag')
             run('xdotool','mousemove','300','280','mousedown','3','mousemove','700','280','mouseup','3');time.sleep(.3)
             right=screenshot('after-right-drag');assert right.getpixel((400,280))==baseline.getpixel((400,280)),'Right drag drew ink'
+            if cycle in (0,1):
+                # Measure both laser and hand fades after settling pointer motion.
+                run('xdotool','mousemove','1100','100');time.sleep(1.1)
+                trace=output/f'app-{cycle+1}.log';offset=trace.stat().st_size
+                work=list(map(int,re.findall(r'-?\d+',run('xprop','-root','_NET_WORKAREA').stdout.split('=',1)[1])));bottom=work[1]+work[3]
+                run('xdotool','mousemove','640',str(bottom-35));time.sleep(.45)
+                screenshot('toolbar-polished')
+                run('xdotool','mousemove','1100','100');time.sleep(1.3)
+                records=re.findall(r'took (\d+)ms, strokes=\d+, toolbar=([0-9.]+), time_us=(\d+)',trace.read_text()[offset:])
+                if records:
+                    frames=[(int(us),float(alpha),int(cost)) for cost,alpha,us in records]
+                    rising=[f for i,f in enumerate(frames[1:],1) if 0<f[1]<1 and f[1]>frames[i-1][1]]
+                    falling=[f for i,f in enumerate(frames[1:],1) if 0<f[1]<1 and f[1]<frames[i-1][1]]
+                    intervals=[b[0]-a[0] for group in [rising,falling] for a,b in zip(group,group[1:])]
+                    assert len(rising)>=6 and len(falling)>=15,f'Too few fade frames: {len(rising)}, {len(falling)}'
+                    intervals.sort();p95=intervals[int((len(intervals)-1)*.95)]/1000
+                    assert p95<30,f'Toolbar frame pacing regressed: p95 {p95:.1f}ms'
+                    metrics={'pointer_style':cfg.read_text().split('style=')[1].splitlines()[0],'reveal_frames':len(rising),'hide_frames':len(falling),'median_frame_ms':intervals[len(intervals)//2]/1000,'p95_frame_ms':p95,'max_render_ms':max(f[2] for f in rising+falling)}
+                    (output/f'toolbar-performance-{cycle}.json').write_text(json.dumps(metrics,indent=2));print('Toolbar timing: '+json.dumps(metrics),flush=True)
+                else:
+                    print('Baseline fade frames: '+str(trace.read_text()[offset:].count('frame at ')),flush=True)
             # Modern D-Bus menu must expose exact protocol signatures and actions.
             name=f'org.kde.StatusNotifierItem-{app.pid}-1'
             layout=run('gdbus','call','--session','--dest',name,'--object-path','/Menu','--method','com.canonical.dbusmenu.GetLayout','--','0','-1','[]').stdout

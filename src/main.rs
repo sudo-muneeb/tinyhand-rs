@@ -146,6 +146,9 @@ struct App {
     clear_key: (i32, u32),
     redraw_pending: bool,
     last_render: Instant,
+    frames: tinyhand_rs::toolbar::FrameClock,
+    fade: tinyhand_rs::toolbar::Fade,
+    started: Instant,
 }
 
 fn shortcut(display: *mut Display, value: &str) -> (i32, u32) {
@@ -299,6 +302,9 @@ impl App {
             clear_key,
             redraw_pending: false,
             last_render: Instant::now() - Duration::from_millis(34),
+            frames: tinyhand_rs::toolbar::FrameClock::new(Instant::now(), 60_000),
+            fade: tinyhand_rs::toolbar::Fade::new(1.0, Instant::now()),
+            started: Instant::now(),
         };
         if let Err(error) = app.renderer.select_config(&app.config) {
             eprintln!("tinyhand-rs: {error}; using the built-in pointer");
@@ -467,10 +473,16 @@ impl App {
         }
         self.revealed = Instant::now() + Duration::from_secs(3);
         self.hint_until = Instant::now() + Duration::from_secs(9);
-        self.renderer.toolbar_alpha = 1.0;
+        self.renderer.toolbar_alpha = 0.0;
+        self.fade = tinyhand_rs::toolbar::Fade::new(0.0, Instant::now());
+        self.fade.target(true, Instant::now());
         self.renderer.hint = true;
         self.query_pointer();
         self.place_bar();
+        let refresh = gtk::gdk::Display::default()
+            .and_then(|d| d.monitor_at_point(self.cursor.x as i32, self.cursor.y as i32))
+            .map_or(60_000, |m| m.refresh_rate());
+        self.frames = tinyhand_rs::toolbar::FrameClock::new(Instant::now(), refresh);
         self.renderer.invalidate();
         let escape = XKeysymToKeycode(self.display, 0xff1b) as i32;
         for extra in [0, 2, 16, 18] {
@@ -535,6 +547,7 @@ impl App {
     unsafe fn render(&mut self, now: Instant) {
         if self.active && self.redraw_pending {
             let begin = Instant::now();
+            self.renderer.toolbar_alpha = self.fade.value(now);
             self.renderer.paint(
                 &self.config,
                 &self.ink,
@@ -546,11 +559,13 @@ impl App {
             XFlush(self.display);
             if self.trace {
                 eprintln!(
-                    "frame at {},{} took {}ms, strokes={}",
+                    "frame at {},{} took {}ms, strokes={}, toolbar={:.4}, time_us={}",
                     self.cursor.x,
                     self.cursor.y,
                     begin.elapsed().as_millis(),
-                    self.ink.strokes.len()
+                    self.ink.strokes.len(),
+                    self.renderer.toolbar_alpha,
+                    now.duration_since(self.started).as_micros()
                 );
             }
             self.last_render = now;
@@ -1110,27 +1125,18 @@ impl App {
                 {
                     self.revealed = now + Duration::from_millis(700);
                 }
-                let target = if !self.ink.is_drawing()
-                    && (now < self.revealed || self.page > 0 || self.toolbar_drag.is_some())
-                {
-                    1.0
-                } else {
-                    0.0
-                };
-                let old = self.renderer.toolbar_alpha;
-                let dt = now
-                    .saturating_duration_since(self.last_render)
-                    .as_secs_f64()
-                    .min(0.05);
-                let next = if target > old {
-                    (old + dt / 0.15).min(1.0)
-                } else {
-                    (old - dt / 0.35).max(0.0)
-                };
+                let visible = !self.ink.is_drawing()
+                    && (now < self.revealed || self.page > 0 || self.toolbar_drag.is_some());
+                let changed = self.fade.target(visible, now);
                 let hint = now < self.hint_until;
-                if next != old || self.renderer.hint != hint {
-                    self.renderer.toolbar_alpha = next;
+                let hover = if visible {
+                    tinyhand_rs::toolbar::hit(&self.config, x, y)
+                } else {
+                    None
+                };
+                if changed || self.renderer.hint != hint || self.renderer.hover != hover {
                     self.renderer.hint = hint;
+                    self.renderer.hover = hover;
                     self.draw();
                 }
             }
@@ -1197,36 +1203,26 @@ impl App {
                 self.draw();
             }
             let animating = self.active
-                && ((self.renderer.toolbar_alpha > 0.0 && self.renderer.toolbar_alpha < 1.0)
+                && (self.fade.animating(now)
                     || self.renderer.motion_animating()
-                    || self.ink.needs_animation(now)
-                    || self
-                        .pressed
-                        .is_some_and(|t| now.duration_since(t) < Duration::from_millis(300)));
-            let animation_interval = if self.renderer.motion_animating() {
-                16
-            } else {
-                33
-            };
+                    || self.ink.needs_animation(now));
+            // Include the final fully opaque/transparent frame after a fade.
             if self.active
                 && (old != self.ink.strokes.len()
-                    || (animating
-                        && now.duration_since(self.last_render)
-                            >= Duration::from_millis(animation_interval)))
+                    || animating
+                    || self.renderer.toolbar_alpha != self.fade.value(now))
             {
                 self.draw();
             }
-            let elapsed = now.duration_since(self.last_render);
-            if self.redraw_pending && (events == 0 || elapsed >= Duration::from_millis(16)) {
+            if self.redraw_pending && self.frames.ready(now) {
                 self.render(now);
+                self.frames.presented(Instant::now());
             }
             if XPending(self.display) > 0 {
                 continue;
             }
-            let wait = if self.redraw_pending {
-                16_u64.saturating_sub(self.last_render.elapsed().as_millis() as u64)
-            } else if animating {
-                animation_interval.saturating_sub(self.last_render.elapsed().as_millis() as u64)
+            let wait = if self.redraw_pending || animating {
+                self.frames.wait_ms(Instant::now())
             } else {
                 500
             };

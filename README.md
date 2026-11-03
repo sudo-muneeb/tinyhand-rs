@@ -10,7 +10,7 @@ Linux Mint Cinnamon and other composited X11 desktops. It includes the original
 Install the Debian package, or extract the portable archive and run its binary:
 
 ```sh
-sudo apt install ./tinyhand-rs_0.2.0_amd64.deb
+sudo apt install ./tinyhand-rs_0.2.1_amd64.deb
 tinyhand-rs
 ```
 
@@ -29,6 +29,8 @@ restore the previous shortcuts.
 The toolbar sits eight logical pixels above the desktop panel. It fades away
 when you draw or move away; approach the bottom of the screen to reveal it.
 Choose a pinned hand, change ink colour, mute taps, clear, open settings or exit.
+Toolbar fades follow the active display refresh rate (60 Hz when unavailable);
+cached artwork and controls keep animation work small and stop updating at rest.
 Drag pointers to reorder them, or drag them away to remove them. Settings offers
 all 37 pointers, up to eight toolbar pins, a replacement picker when full, and a toolbar reset.
 

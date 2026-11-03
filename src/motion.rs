@@ -10,6 +10,7 @@ pub struct HandGeometry {
     pub rod_end: f64,
     pub tip: Point,
     pub rod_x: f64,
+    pub rod_width: f64,
 }
 
 impl Default for HandGeometry {
@@ -21,11 +22,12 @@ impl Default for HandGeometry {
             rod_end: 384.0,
             tip: Point { x: 128.0, y: 0.0 },
             rod_x: 128.0,
+            rod_width: 16.0,
         }
     }
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub struct HandPose {
     pub angle: f64,
     pub scale: f64,

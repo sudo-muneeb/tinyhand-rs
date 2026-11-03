@@ -478,6 +478,7 @@ extern "C" {
     pub fn cairo_surface_status(s: *mut Surface) -> c_int;
     pub fn cairo_image_surface_get_width(s: *mut Surface) -> c_int;
     pub fn cairo_image_surface_get_height(s: *mut Surface) -> c_int;
+    pub fn cairo_surface_mark_dirty(s: *mut Surface);
     pub fn cairo_surface_flush(s: *mut Surface);
     pub fn cairo_surface_destroy(s: *mut Surface);
     pub fn cairo_create(s: *mut Surface) -> *mut Cairo;

@@ -96,6 +96,18 @@ pub(super) unsafe fn measure_hand(image: *mut Surface) -> HandGeometry {
             _ => w as f64 / 2.0,
         }
     };
+    // Keep every visible rod pixel, including a wider cuff transition, while
+    // excluding the large transparent side margins of the original canvas.
+    let rod_x = center((wrist + rod_end) / 2);
+    let mut rod_half = 0.5_f64;
+    for y in wrist..rod_end {
+        if let Some(first) = (0..w).find(|x| *data.add(y * stride + x * 4 + 3) > 8) {
+            rod_half = rod_half.max((first as f64 - rod_x).abs());
+        }
+        if let Some(last) = (0..w).rfind(|x| *data.add(y * stride + x * 4 + 3) > 8) {
+            rod_half = rod_half.max((last as f64 - rod_x).abs());
+        }
+    }
     HandGeometry {
         width: w as f64,
         top: (top as f64 - 1.0).max(0.0),
@@ -105,7 +117,8 @@ pub(super) unsafe fn measure_hand(image: *mut Surface) -> HandGeometry {
             x: center(top),
             y: top as f64,
         },
-        rod_x: center((wrist + rod_end) / 2),
+        rod_x,
+        rod_width: rod_half * 2.0 + 1.0,
     }
 }
 
@@ -119,9 +132,21 @@ impl Renderer {
         let left = -a.tip.x * pose.scale;
         let right = (a.width - a.tip.x) * pose.scale;
         let top = (a.top - a.tip.y) * pose.scale;
+        let wrist = pose.rod_start;
         let bottom = pose.rod_start + pose.rod_length;
+        let rod_left = (a.rod_x - a.tip.x - a.rod_width * 0.5 - 3.0) * pose.scale;
+        let rod_right = (a.rod_x - a.tip.x + a.rod_width * 0.5 + 3.0) * pose.scale;
         let mut bounds = Rect::around(cursor, 36.0);
-        for (x, y) in [(left, top), (right, top), (left, bottom), (right, bottom)] {
+        for (x, y) in [
+            (left, top),
+            (right, top),
+            (left, wrist),
+            (right, wrist),
+            (rod_left, wrist),
+            (rod_right, wrist),
+            (rod_left, bottom),
+            (rod_right, bottom),
+        ] {
             let p = Point {
                 x: cursor.x + x * cos - y * sin,
                 y: cursor.y + x * sin + y * cos,
@@ -129,14 +154,63 @@ impl Renderer {
             bounds = bounds.union(Rect::around(p, 8.0));
         }
         if config.shadow {
+            let blur = (2.5 / self.shadow_scale * pose.scale).max(4.0);
             bounds = bounds.union(Rect {
-                x: bounds.x + pose.lift * 0.6 - 4.0,
-                y: bounds.y + pose.lift - 4.0,
-                w: bounds.w + 8.0,
-                h: bounds.h + 8.0,
+                x: bounds.x + pose.lift * 0.6 - blur,
+                y: bounds.y + pose.lift - blur,
+                w: bounds.w + 2.0 * blur,
+                h: bounds.h + 2.0 * blur,
             });
         }
         bounds
+    }
+
+    /// Build a small alpha mask once per hand; moving shadows need one pass.
+    pub(super) unsafe fn prepare_shadow(&mut self) {
+        if !self.shadow.is_null() {
+            cairo_surface_destroy(self.shadow);
+        }
+        let w = cairo_image_surface_get_width(self.hand);
+        let h = cairo_image_surface_get_height(self.hand);
+        let sw = 128.min(w);
+        let sh = (h as f64 * sw as f64 / w as f64).round() as i32;
+        self.shadow_scale = sw as f64 / w as f64;
+        self.shadow = cairo_image_surface_create(2, sw, sh);
+        let c = cairo_create(self.shadow);
+        cairo_scale(c, self.shadow_scale, self.shadow_scale);
+        cairo_set_source_surface(c, self.hand, 0.0, 0.0);
+        cairo_paint(c);
+        cairo_destroy(c);
+        cairo_surface_flush(self.shadow);
+        let stride = cairo_image_surface_get_stride(self.shadow) as usize;
+        let data = cairo_image_surface_get_data(self.shadow);
+        let (sw, sh) = (sw as usize, sh as usize);
+        let mut horizontal = vec![0_u8; sw * sh];
+        for y in 0..sh {
+            for x in 0..sw {
+                let mut sum = 0_u32;
+                for dx in -2..=2 {
+                    let sx = x as i32 + dx;
+                    if (0..sw as i32).contains(&sx) {
+                        sum += *data.add(y * stride + sx as usize) as u32;
+                    }
+                }
+                horizontal[y * sw + x] = (sum / 5) as u8;
+            }
+        }
+        for y in 0..sh {
+            for x in 0..sw {
+                let mut sum = 0_u32;
+                for dy in -2..=2 {
+                    let sy = y as i32 + dy;
+                    if (0..sh as i32).contains(&sy) {
+                        sum += horizontal[sy as usize * sw + x] as u32;
+                    }
+                }
+                *data.add(y * stride + x) = (sum / 5) as u8;
+            }
+        }
+        cairo_surface_mark_dirty(self.shadow);
     }
 
     pub(super) unsafe fn paint_hand(
@@ -146,18 +220,12 @@ impl Renderer {
         cursor: Point,
         pose: HandPose,
     ) {
-        if config.shadow {
-            for spread in [-3.0, 0.0, 3.0] {
-                cairo_save(c);
-                cairo_translate(
-                    c,
-                    cursor.x + pose.lift * 0.6 + spread,
-                    cursor.y + pose.lift + spread,
-                );
-                cairo_rotate(c, pose.angle);
-                self.hand_parts(c, pose, config.opacity * 0.07, true);
-                cairo_restore(c);
-            }
+        if config.shadow && !self.shadow.is_null() {
+            cairo_save(c);
+            cairo_translate(c, cursor.x + pose.lift * 0.6, cursor.y + pose.lift);
+            cairo_rotate(c, pose.angle);
+            self.hand_parts(c, pose, config.opacity * 0.20, true);
+            cairo_restore(c);
         }
         cairo_save(c);
         cairo_translate(c, cursor.x, cursor.y);
@@ -173,7 +241,14 @@ impl Renderer {
             cairo_translate(c, 0.0, pose.rod_start);
             cairo_scale(c, pose.scale, pose.rod_length / (a.rod_end - a.wrist));
             cairo_new_path(c);
-            cairo_rectangle(c, -a.tip.x, 0.0, a.width, a.rod_end - a.wrist);
+            let pad = if mask { 2.5 / self.shadow_scale } else { 2.0 };
+            cairo_rectangle(
+                c,
+                a.rod_x - a.tip.x - a.rod_width * 0.5 - pad,
+                0.0,
+                a.rod_width + 2.0 * pad,
+                a.rod_end - a.wrist,
+            );
             cairo_clip(c);
             self.paint_piece(c, -a.tip.x, -a.wrist, opacity, mask);
             cairo_restore(c);
@@ -202,7 +277,10 @@ impl Renderer {
     unsafe fn paint_piece(&self, c: *mut Cairo, x: f64, y: f64, opacity: f64, mask: bool) {
         if mask {
             cairo_set_source_rgba(c, 0.0, 0.0, 0.0, opacity);
-            cairo_mask_surface(c, self.hand, x, y);
+            cairo_save(c);
+            cairo_scale(c, 1.0 / self.shadow_scale, 1.0 / self.shadow_scale);
+            cairo_mask_surface(c, self.shadow, x * self.shadow_scale, y * self.shadow_scale);
+            cairo_restore(c);
         } else {
             cairo_set_source_surface(c, self.hand, x, y);
             cairo_paint_with_alpha(c, opacity);

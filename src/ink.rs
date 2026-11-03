@@ -57,6 +57,7 @@ pub struct Ink {
     pub strokes: Vec<Stroke>,
     start: Option<(Point, Brush)>,
     active: bool,
+    revision: u64,
 }
 
 impl Default for Ink {
@@ -71,6 +72,7 @@ impl Ink {
             strokes: vec![],
             start: None,
             active: false,
+            revision: 0,
         }
     }
     pub fn down(&mut self, p: Point) {
@@ -98,6 +100,7 @@ impl Ink {
                     .is_some_and(|last| last.distance(p) > 2.0)
                 {
                     stroke.points.push(p);
+                    self.revision = self.revision.wrapping_add(1);
                     if stroke.points.len() > 8192 {
                         stroke.points = stroke.points.iter().step_by(2).copied().collect();
                     }
@@ -109,18 +112,27 @@ impl Ink {
         if self.active {
             if let Some(last) = self.strokes.last_mut() {
                 last.released = Some(now);
+                self.revision = self.revision.wrapping_add(1);
             }
         }
         self.start = None;
         self.active = false;
     }
+    pub fn revision(&self) -> u64 {
+        self.revision
+    }
     pub fn clear(&mut self) {
+        self.revision = self.revision.wrapping_add(1);
         self.strokes.clear();
         self.start = None;
         self.active = false;
     }
     pub fn prune(&mut self, now: Instant, _fade: Duration) {
+        let old = self.strokes.len();
         self.strokes.retain(|s| s.opacity(now) > 0.0);
+        if old != self.strokes.len() {
+            self.revision = self.revision.wrapping_add(1);
+        }
     }
     pub fn needs_animation(&self, now: Instant) -> bool {
         self.strokes.iter().any(|s| s.fading(now))

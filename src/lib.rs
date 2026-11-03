@@ -1,8 +1,16 @@
 pub mod colors;
 pub mod config;
+pub mod desktop;
 pub mod ffi;
+pub mod hands;
 pub mod ink;
+pub mod input;
+pub mod instance;
+pub mod logging;
 pub mod motion;
+pub mod native_settings;
 pub mod render;
 pub mod settings;
 pub mod sound;
+pub mod toolbar;
+pub mod tray;

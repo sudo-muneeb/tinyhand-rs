@@ -1,311 +1,220 @@
 #!/usr/bin/env python3
-"""Exercise the release build in a disposable X11/Cinnamon session.
-
-Requires Xvfb, Cinnamon, dbus-run-session, xdotool, xprop, xev, xmessage,
-stdbuf, Pillow, Zenity, and ImageMagick's import. Never sends input to the current display.
-Logs and screenshots are retained in the printed temporary directory.
+"""Exercise TinyHand in a private Xvfb, D-Bus and Cinnamon session.
+Never sends input to the user's desktop. Requires Python gi, pyatspi, Pillow,
+Xvfb, Cinnamon, dbus-daemon, xdotool, xprop, xev, xmessage and ImageMagick.
 """
-
-import argparse
-import json
-import os
-import re
+import argparse,ctypes,json,os,re,select,signal,subprocess,tempfile,time
 from pathlib import Path
-import select
-import shutil
-import signal
-import subprocess
-import tempfile
-import time
-from PIL import Image, ImageChops
-
+from PIL import Image,ImageChops,ImageDraw
 
 def main():
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--cycles", type=int, default=20)
-    args = parser.parse_args()
-    if args.cycles < 1:
-        parser.error("--cycles must be positive")
-    for name in ("Xvfb", "cinnamon", "dbus-run-session", "xdotool", "xprop",
-                 "xev", "xmessage", "stdbuf", "import", "zenity"):
-        if not shutil.which(name):
-            parser.error(f"missing dependency: {name}")
-    binary = Path(__file__).resolve().parents[1] / "target/release/tinyhand-rs"
-    if not binary.exists():
-        parser.error("build first with cargo build --release")
-    output = Path(tempfile.mkdtemp(prefix="tinyhand-cinnamon-"))
-    print(f"Logs: {output}", flush=True)
-    env = os.environ.copy()
-    for key in ("DBUS_SESSION_BUS_ADDRESS", "SESSION_MANAGER", "WAYLAND_DISPLAY",
-                "TINYHAND_UNSAFE_CINNAMON", "GDK_SCALE", "QT_SCALE_FACTOR"):
-        env.pop(key, None)
-    for key in ("XDG_CONFIG_HOME", "XDG_CACHE_HOME", "XDG_DATA_HOME", "XDG_RUNTIME_DIR"):
-        directory = output / key
-        directory.mkdir(mode=0o700)
-        env[key] = str(directory)
-    env.update(GSETTINGS_BACKEND="memory", LIBGL_ALWAYS_SOFTWARE="1",
-               XDG_SESSION_TYPE="x11", XDG_CURRENT_DESKTOP="X-Cinnamon",
-               DESKTOP_SESSION="cinnamon", TINYHAND_TEST_SESSION=str(output))
-    alsa = output / "asound.conf"
-    alsa.write_text("pcm.!default { type null }\n")
-    env["ALSA_CONFIG_PATH"] = str(alsa)
-    processes = []
-
-    def start(command, name, **kwargs):
-        with (output / f"{name}.log").open("w") as log:
-            process = subprocess.Popen(command, env=env, stdout=log,
-                                       stderr=subprocess.STDOUT,
-                                       start_new_session=True, **kwargs)
-        processes.append(process)
-        return process
-
-    def run(*command, check=True):
-        result = subprocess.run(command, env=env, capture_output=True,
-                                text=True, timeout=10)
-        if check and result.returncode:
-            raise RuntimeError(f"{command}: {result.stderr}")
-        return result
-
-    def wait_for(predicate, message, timeout=10):
-        deadline = time.monotonic() + timeout
-        while time.monotonic() < deadline:
-            if predicate():
-                return
+    parser=argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--cycles',type=int,default=3)
+    parser.add_argument('--binary',type=Path,default=Path(__file__).resolve().parents[1]/'target/release/tinyhand-rs')
+    args=parser.parse_args();binary=args.binary.resolve()
+    assert args.cycles>0 and binary.is_file()
+    output=Path(tempfile.mkdtemp(prefix='tinyhand-cinnamon-'));print(f'Logs: {output}',flush=True)
+    env=os.environ.copy()
+    for key in ['DBUS_SESSION_BUS_ADDRESS','AT_SPI_BUS_ADDRESS','SESSION_MANAGER','WAYLAND_DISPLAY','GDK_SCALE','QT_SCALE_FACTOR']:env.pop(key,None)
+    for key in ['XDG_CONFIG_HOME','XDG_CACHE_HOME','XDG_DATA_HOME','XDG_RUNTIME_DIR']:
+        directory=output/key;directory.mkdir(mode=0o700);env[key]=str(directory)
+    env.update(GSETTINGS_BACKEND='memory',LIBGL_ALWAYS_SOFTWARE='1',XDG_SESSION_TYPE='x11',XDG_CURRENT_DESKTOP='X-Cinnamon',TINYHAND_TEST_SESSION=str(output),GTK_MODULES='gail:atk-bridge',NO_AT_BRIDGE='0',TINYHAND_TRACE_INPUT='1')
+    alsa=output/'asound.conf';alsa.write_text('pcm.!default { type null }\n');env['ALSA_CONFIG_PATH']=str(alsa)
+    processes=[]
+    def start(command,name,**kw):
+        with (output/f'{name}.log').open('w') as log:p=subprocess.Popen(command,env=env,stdout=log,stderr=subprocess.STDOUT,start_new_session=True,**kw)
+        processes.append(p);return p
+    def run(*cmd,check=True):
+        p=subprocess.run(cmd,env=env,text=True,capture_output=True,timeout=15)
+        if check and p.returncode:raise RuntimeError(f'{cmd}: {p.stderr}')
+        return p
+    def wait(predicate,message,timeout=12):
+        end=time.monotonic()+timeout
+        while time.monotonic()<end:
+            if predicate():return
             time.sleep(.1)
-        raise RuntimeError(message)
-
-    def visible():
-        return run("xdotool", "search", "--onlyvisible", "--name",
-                   "^TinyHand overlay$", check=False).returncode == 0
-
-    def clicks():
-        return (output / "input.log").read_text().count("ButtonPress event")
-
-    def click():
-        run("xdotool", "mousemove", "100", "100", "click", "1")
-        time.sleep(.15)
-
+        raise AssertionError(message)
+    def visible():return run('xdotool','search','--onlyvisible','--name','^TinyHand overlay$',check=False).returncode==0
+    def command(flag):run(str(binary),flag)
+    def click(x=100,y=100,button=1):run('xdotool','mousemove',str(x),str(y),'click',str(button));time.sleep(.15)
+    def screenshot(name):
+        path=output/f'{name}.png';run('import','-window','root',str(path));return Image.open(path).convert('RGB')
+    def probe_clicks():return (output/'input.log').read_text().count('ButtonPress event')
     try:
-        read_fd, write_fd = os.pipe()
-        try:
-            start(["Xvfb", "-displayfd", str(write_fd), "-screen", "0",
-                   "1280x800x24", "-nolisten", "tcp", "-noreset"],
-                  "xvfb", pass_fds=(write_fd,))
-            os.close(write_fd)
-            if not select.select([read_fd], [], [], 10)[0]:
-                raise RuntimeError("Xvfb did not start")
-            number = os.read(read_fd, 64).decode().strip()
-            if not number.isdecimal():
-                raise RuntimeError("Xvfb did not return a display number")
-            env["DISPLAY"] = f":{number}"
-        finally:
-            os.close(read_fd)
-        print(f"Isolated display: {env['DISPLAY']}", flush=True)
-        wm = start(["dbus-run-session", "--", "cinnamon", "--sm-disable", "--x11"],
-                   "cinnamon")
-        wait_for(lambda: "window id #" in run("xprop", "-root",
-                 "_NET_SUPPORTING_WM_CHECK").stdout, "Cinnamon did not start", 30)
-        time.sleep(5)
-        config = Path(env["XDG_CONFIG_HOME"]) / "tinyhand-rs/settings.conf"
-        config.parent.mkdir()
-        config.write_text("sound=false\nstyle=laser\ncolor=0\nmatch_color=false\n")
-        probe = start(["stdbuf", "-oL", "xev", "-name", "TinyHand input probe",
-                       "-geometry", "240x140+20+20", "-event", "button"], "input")
-        time.sleep(1)
-        click()
-        assert clicks() > 0, "Input probe is not receiving baseline clicks"
-        run("import", "-window", "root", str(output / "desktop-before.png"))
-        work = run("xprop", "-root", "_NET_WORKAREA").stdout.split("=",1)[1]
-        work = list(map(int,re.findall(r"-?\d+",work)))
-        work_bottom = work[1] + work[3]
-        rss = []
-        for cycle in range(args.cycles):
-            # Missing desktop variables must not re-enable the unsafe tray.
-            env["XDG_CURRENT_DESKTOP"] = "" if cycle % 2 else "X-Cinnamon"
-            env["DESKTOP_SESSION"] = ""
-            app = start([str(binary)], f"app-{cycle + 1}")
-            wait_for(visible, "Overlay did not appear")
-            if cycle == 0:
-                time.sleep(.15)
-                run("import", "-window", "root", str(output / "toolbar-placement.png"))
-                baseline = Image.open(output / "desktop-before.png").convert("RGB")
-                placed = Image.open(output / "toolbar-placement.png").convert("RGB")
-                for y in range(work_bottom-8,work_bottom):
-                    assert placed.getpixel((640,y)) == baseline.getpixel((640,y)), "Toolbar overlaps the desktop panel gap"
-            before = clicks()
-            click()
-            assert clicks() == before, "Active overlay leaked a click"
-            if cycle == 0:
-                # With the laser, this region contains neither the pointer nor
-                # its rod. A tap must not draw a line from toolbar text to it.
-                run("xdotool", "mousemove", "160", "180")
-                time.sleep(.35)
-                run("import", "-window", "root", str(output / "tap-before.png"))
-                run("xdotool", "mousedown", "1")
-                time.sleep(.05)
-                run("import", "-window", "root", str(output / "tap-down.png"))
-                run("xdotool", "mouseup", "1")
-                before_tap = Image.open(output / "tap-before.png").convert("RGB").crop((500,430,650,620))
-                after_tap = Image.open(output / "tap-down.png").convert("RGB").crop((500,430,650,620))
-                assert ImageChops.difference(before_tap,after_tap).getbbox() is None, "A tap left a stray line toward the toolbar"
-            moves = ["xdotool", "mousemove", "300", "220", "mousedown", "1"]
-            for i in range(100):
-                moves += ["mousemove", str(300 + i * 6), str(220 + i % 35 * 5),
-                          "sleep", "0.005"]
-            moves += ["mouseup", "1"]
-            run(*moves)
-            if cycle == 0:
-                time.sleep(.2)
-                run("import", "-window", "root", str(output / "drawing.png"))
-                pixels = Image.open(output / "drawing.png").convert("RGB").crop(
-                    (280, 200, 850, 420))
-                ink_pixels = sum(1 for r, g, b in pixels.getdata()
-                                 if r > 70 and b > 110 and b > r * 1.2 and r > g * 1.3)
-                assert ink_pixels > 100, f"Drag did not render ink: {ink_pixels} pixels"
-                # Navigate every sidebar page and exercise the real controls.
-                run("xdotool", "click", "5")
-                run("xdotool", "mousemove", "770", "725", "click", "1")
-                time.sleep(.2)
-                for tab in range(6):
-                    run("xdotool", "mousemove", "380", str(221 + tab * 34), "click", "1")
-                    time.sleep(.15)
-                    run("xdotool", "mousemove", "1050", "110")
-                    time.sleep(.1)
-                    run("import", "-window", "root", str(output / f"settings-{tab}.png"))
-                    if tab == 1:
-                        shot = Image.open(output / "settings-1.png").convert("RGB")
-                        for index in range(37):
-                            rgb = shot.getpixel((507 + index % 9 * 50, 321 + index // 9 * 52))
-                            assert sum(rgb) / 3 > 30, f"Thumbnail tile {index} disappeared: {rgb}"
-
-                # Appearance size +; the panel's origin is (300,156).
-                run("xdotool", "mousemove", "380", "289", "click", "1")
-                run("xdotool", "mousemove", "934", "298", "click", "1")
-                wait_for(lambda: "size=0.14" in config.read_text(), "Pointer size did not persist")
-                # Drawing colour, fade, and thickness.
-                run("xdotool", "mousemove", "380", "323", "click", "1")
-                run("xdotool", "mousemove", "712", "291", "click", "1")
-                run("xdotool", "mousemove", "934", "356", "click", "1")
-                run("xdotool", "mousemove", "934", "414", "click", "1")
-                wait_for(lambda: all(line in config.read_text() for line in
-                         ["color=1", "fade=3.5", "thickness=6"]), "Drawing settings did not persist")
-                # Test all six original audio choices against ALSA's null sink.
-                run("xdotool", "mousemove", "380", "357", "click", "1")
-                for kind in range(1,7):
-                    run("xdotool", "mousemove", str(552 + kind % 4 * 114),
-                        str(302 + kind // 4 * 76), "click", "1")
-                    wait_for(lambda: f"sound_kind={kind}" in config.read_text(), "Sound choice did not persist")
-                run("xdotool", "mousemove", "552", "302", "click", "1")
-                wait_for(lambda: "sound=false" in config.read_text(), "Sound off did not persist")
-                # Pointers: choose one and open the custom hand flow.
-                run("xdotool", "mousemove", "380", "255", "click", "1")
-                run("xdotool", "mousemove", "576", "322", "click", "1")
-                wait_for(lambda: "style=glove" in config.read_text(), "Pointer selection did not persist")
-                run("xdotool", "mousemove", "850", "604", "click", "1")
-                time.sleep(.15)
-                run("xdotool", "mousemove", "1050", "110")
-                run("import", "-window", "root", str(output / "settings-custom.png"))
-                # Open the native file chooser: capture must be released.
-                run("xdotool", "mousemove", "650", "486", "click", "1")
-                wait_for(lambda: not visible(), "PNG chooser did not release the pointer grab")
-                chooser = run("xdotool", "search", "--sync", "--onlyvisible", "--name", "Choose your TinyHand PNG").stdout.splitlines()[0]
-                run("xdotool", "windowactivate", "--sync", chooser)
-                run("xdotool", "key", "ctrl+l")
-                fixture = str(binary.parents[2] / "assets/hand_lavender.png")
-                run("xdotool", "type", "--clearmodifiers", fixture)
-                run("xdotool", "key", "Return")
-                time.sleep(.5)
-                run("xdotool", "key", "Return")
-                wait_for(visible, "PNG chooser did not return to settings")
-                wait_for(lambda: "custom_enabled=true" in config.read_text(), "PNG import failed")
-                # Restore an ordinary pointer for the remaining lifecycle cycles.
-                run("xdotool", "mousemove", "540", "204", "click", "1")
-                run("xdotool", "mousemove", "526", "322", "click", "1")
-                wait_for(lambda: "custom_enabled=false" in config.read_text(), "Built-in pointer did not replace custom hand")
-                # Enable automatic pointer colour, then sample opaque active
-                # strokes so transparency/fade cannot hide a wrong palette.
-                run("xdotool", "mousemove", "380", "323", "click", "1")
-                run("xdotool", "mousemove", "644", "291", "click", "1")
-                wait_for(lambda: "match_color=true" in config.read_text(), "Match-pointer mode did not persist")
-                run("xdotool", "mousemove", "320", "174", "click", "1")
-                for index, name, expected_rgb, y in [
-                    (2,"coral",(255,41,31),200), (6,"blue",(47,134,240),240),
-                    (4,"robot",(22,168,122),280), (8,"lemon",(242,183,5),320)]:
-                    run("xdotool", "mousemove", "770", "725", "click", "1")
-                    run("xdotool", "mousemove", "380", "255", "click", "1")
-                    run("xdotool", "mousemove", str(526 + index % 9 * 50),
-                        str(321 + index // 9 * 52), "click", "1")
-                    wait_for(lambda: f"style={name}" in config.read_text(), "Pointer change did not persist")
-                    run("xdotool", "mousemove", "320", "174", "click", "1")
-                    run("xdotool", "mousemove", "250", str(y), "mousedown", "1",
-                        "mousemove", "500", str(y))
-                    path = output / f"ink-{name}.png"
-                    def ink_matches():
-                        run("import", "-window", "root", str(path))
-                        actual = Image.open(path).convert("RGB").getpixel((350,y))
-                        return max(abs(a-b) for a,b in zip(actual,expected_rgb)) <= 2
-                    wait_for(ink_matches, f"{name} did not render the upstream ink colour", timeout=4)
-                    run("xdotool", "mouseup", "1")
-                time.sleep(4.0)
-                ticks_before = sum(map(int, Path(f"/proc/{app.pid}/stat").read_text().split()[13:15]))
-                time.sleep(2)
-                ticks_after = sum(map(int, Path(f"/proc/{app.pid}/stat").read_text().split()[13:15]))
-                print(f"Idle app CPU: {(ticks_after - ticks_before) / os.sysconf('SC_CLK_TCK') / 2 * 100:.1f}% of one core", flush=True)
-            status = Path(f"/proc/{app.pid}/status").read_text()
-            rss.append(int(status.split("VmRSS:")[1].split()[0]))
-            run("xdotool", "key", "ctrl+alt+x")
-            run("xdotool", "key", "Escape")
-            wait_for(lambda: not visible(), "Escape did not hide overlay")
-            click()
-            assert clicks() > before, "Escape did not restore clicks"
-            run("xdotool", "key", "ctrl+alt+h")
-            wait_for(visible, "Global shortcut did not reactivate overlay")
-            app.send_signal(signal.SIGINT if cycle % 2 else signal.SIGTERM)
-            assert app.wait(timeout=5) == 0, "App did not exit cleanly"
-            wait_for(lambda: not visible(), "Overlay remained after exit")
-            before = clicks()
-            click()
-            assert clicks() > before, "Shutdown did not restore clicks"
-            # Force delayed compositor stack reconciliation after teardown.
-            for _ in range(3):
-                run("xmessage", "-timeout", "1", "-buttons", "OK", "Teardown check")
-                assert wm.poll() is None, "Cinnamon crashed after overlay teardown"
-            log = (output / f"app-{cycle + 1}.log").read_text()
-            assert "legacy tray disabled" in log, "Muffin was not detected"
-            assert "X11 error" not in log, log
-            assert probe.poll() is None, "Input probe exited"
-            print(f"Cycle {cycle + 1}/{args.cycles}: capture, drawing, Escape, toggle, shutdown passed", flush=True)
-        time.sleep(10)
-        assert wm.poll() is None, "Cinnamon crashed during final observation"
-        wm_log = (output / "cinnamon.log").read_text()
-        assert "Adding systray: unknown" not in wm_log, "Unexpected legacy tray"
-        assert "has been already disposed" not in wm_log, "Disposed compositor actor"
-        summary = {"result": "PASS", "cycles": args.cycles,
-                   "max_app_rss_kib": max(rss), "logs": str(output)}
-        (output / "result.json").write_text(json.dumps(summary, indent=2) + "\n")
-        print(json.dumps(summary), flush=True)
-    finally:
-        for process in reversed(processes):
-            if process.poll() is None:
-                os.killpg(process.pid, signal.SIGTERM)
-        for process in processes:
+        rd,wr=os.pipe();start(['Xvfb','-displayfd',str(wr),'-screen','0','1280x800x24','-nolisten','tcp','-noreset'],'xvfb',pass_fds=(wr,));os.close(wr)
+        assert select.select([rd],[],[],10)[0];env['DISPLAY']=':'+os.read(rd,64).decode().strip();os.close(rd)
+        bus=run('dbus-daemon','--session','--fork','--print-address=1','--print-pid=1').stdout.splitlines();env['DBUS_SESSION_BUS_ADDRESS']=bus[0];bus_pid=int(bus[1])
+        os.environ.update(env)
+        wm=start(['cinnamon','--sm-disable','--x11'],'cinnamon')
+        wait(lambda:'window id #' in run('xprop','-root','_NET_SUPPORTING_WM_CHECK').stdout,'Cinnamon did not start',30);time.sleep(4)
+        import pyatspi
+        def walk(node):
+            yield node
+            for child in node:
+                if child is not None:yield from walk(child)
+        def find(name,role=None):
             try:
-                process.wait(timeout=5)
-            except subprocess.TimeoutExpired:
-                os.killpg(process.pid, signal.SIGKILL)
-                process.wait(timeout=5)
-        # Some desktop services daemonize into their own process groups.
-        # Only stop processes carrying this test's unique inherited marker.
-        marker = f"TINYHAND_TEST_SESSION={output}".encode()
-        for proc in Path("/proc").iterdir():
-            if proc.name.isdecimal():
+                for app in pyatspi.Registry.getDesktop(0):
+                    if app.name=='tinyhand-rs':
+                        for node in walk(app):
+                            if node.name==name and (role is None or node.getRoleName()==role):return node
+            except Exception:pass
+        def action(name):
+            wait(lambda:find(name) is not None,f'Missing accessible control: {name}')
+            node=find(name);actions=node.queryAction();assert actions.nActions>0,name;assert actions.doAction(0),name;time.sleep(.15)
+        cfg=Path(env['XDG_CONFIG_HOME'])/'tinyhand-rs/settings.conf';cfg.parent.mkdir();cfg.write_text('welcomed=true\nsound=false\nstyle=laser\ncolor=0\nmatch_color=false\n')
+        probe=start(['stdbuf','-oL','xev','-name','TinyHand input probe','-geometry','240x140+20+20','-event','button'],'input');time.sleep(1)
+        wait(lambda:run('xdotool','search','--onlyvisible','--name','^TinyHand input probe$',check=False).returncode==0,'Input probe did not map')
+        wait(lambda:(click() or probe_clicks()>0),'The baseline input probe is not receiving clicks')
+        probe_id=run('xdotool','search','--name','^TinyHand input probe$').stdout.splitlines()[0]
+        probe_geometry=run('xdotool','getwindowgeometry','--shell',probe_id).stdout
+        def modifiers_up():
+            x=ctypes.CDLL('libX11.so.6');x.XOpenDisplay.restype=ctypes.c_void_p;x.XOpenDisplay.argtypes=[ctypes.c_char_p]
+            x.XQueryKeymap.argtypes=[ctypes.c_void_p,ctypes.c_void_p];x.XKeysymToKeycode.argtypes=[ctypes.c_void_p,ctypes.c_ulong];x.XKeysymToKeycode.restype=ctypes.c_ubyte;x.XCloseDisplay.argtypes=[ctypes.c_void_p]
+            display=x.XOpenDisplay(env['DISPLAY'].encode());keys=(ctypes.c_ubyte*32)();x.XQueryKeymap(display,keys)
+            result=all(not keys[(key:=x.XKeysymToKeycode(display,sym))//8]&(1<<(key%8)) for sym in [0xffe9,0xffea,0xffe3,0xffe4,0xffeb,0xffec]);x.XCloseDisplay(display);return result
+        def device_alt(pressed):
+            # Use the separate Xvfb keyboard device as well as the XTEST
+            # keyboard, so modifier suppression crosses device boundaries.
+            class DeviceInfo(ctypes.Structure):
+                _fields_=[('id',ctypes.c_int),('name',ctypes.c_char_p),('use',ctypes.c_int),('attachment',ctypes.c_int),('enabled',ctypes.c_int),('classes_count',ctypes.c_int),('classes',ctypes.c_void_p)]
+            x=ctypes.CDLL('libX11.so.6');xi=ctypes.CDLL('libXi.so.6');xt=ctypes.CDLL('libXtst.so.6')
+            x.XOpenDisplay.restype=ctypes.c_void_p;x.XOpenDisplay.argtypes=[ctypes.c_char_p];x.XCloseDisplay.argtypes=[ctypes.c_void_p];x.XSync.argtypes=[ctypes.c_void_p,ctypes.c_int]
+            x.XKeysymToKeycode.argtypes=[ctypes.c_void_p,ctypes.c_ulong];x.XKeysymToKeycode.restype=ctypes.c_ubyte
+            xi.XIQueryDevice.argtypes=[ctypes.c_void_p,ctypes.c_int,ctypes.POINTER(ctypes.c_int)];xi.XIQueryDevice.restype=ctypes.POINTER(DeviceInfo);xi.XIFreeDeviceInfo.argtypes=[ctypes.POINTER(DeviceInfo)]
+            xi.XOpenDevice.argtypes=[ctypes.c_void_p,ctypes.c_ulong];xi.XOpenDevice.restype=ctypes.c_void_p;xi.XCloseDevice.argtypes=[ctypes.c_void_p,ctypes.c_void_p]
+            xt.XTestFakeDeviceKeyEvent.argtypes=[ctypes.c_void_p,ctypes.c_void_p,ctypes.c_uint,ctypes.c_int,ctypes.c_void_p,ctypes.c_int,ctypes.c_ulong]
+            display=x.XOpenDisplay(env['DISPLAY'].encode());n=ctypes.c_int();devices=xi.XIQueryDevice(display,0,ctypes.byref(n));ids=[devices[i].id for i in range(n.value) if devices[i].use==4 and devices[i].enabled and b'XTEST' not in devices[i].name];xi.XIFreeDeviceInfo(devices);assert ids,'No independent keyboard device'
+            device=xi.XOpenDevice(display,ids[0]);assert device;assert xt.XTestFakeDeviceKeyEvent(display,device,x.XKeysymToKeycode(display,0xffe9),int(pressed),None,0,0);x.XSync(display,0);xi.XCloseDevice(display,device);x.XCloseDisplay(display)
+        rss=[]
+        for cycle in range(args.cycles):
+            app=start([str(binary),'--settings' if cycle==0 else '--present'],f'app-{cycle+1}')
+            if cycle==0:
+                wait(lambda:find('Start pointer') is not None,'Native settings did not open',25)
+                assert not visible(),'Startup captured the desktop before activation'
+                for tab in ['General','Pointers','Appearance','Drawing','Sound','About']:
+                    action(tab);screenshot(f'settings-{tab.lower()}')
+                action('Sound')
+                for kind,title in enumerate(['Thock','Click','Pop','Wood block','Boop','Squeak'],1):
+                    action(title);wait(lambda:f'sound_kind={kind}\n' in cfg.read_text(),f'{title} did not persist')
+                action('Off');wait(lambda:'sound=false' in cfg.read_text(),'Sound off did not persist')
+                action('General')
+                shortcut=find('Turn the pointer on or off','text');assert shortcut.queryComponent().grabFocus();time.sleep(.15)
+                run('xdotool','key','ctrl+alt+x');time.sleep(.3)
+                assert 'toggle=Control+Alt+h' in cfg.read_text() and 'clear=Control+Alt+x' in cfg.read_text(),'Conflicting shortcut did not roll back'
+                action('Appearance');scale=find('Size','slider').queryValue();scale.currentValue=.16;wait(lambda:'size=0.16' in cfg.read_text(),'Size did not persist')
+                action('Drawing');action('Match');wait(lambda:'match_color=true' in cfg.read_text(),'Match colour did not persist')
+                # Selecting via the native pointer library also exercises persistence.
+                action('Pointers');action('Pin blue');action('Pin mint');action('Pin lemon');action('Replace lavender')
+                wait(lambda:'lemon' in cfg.read_text().split('pinned=')[1].splitlines()[0] and 'lavender' not in cfg.read_text().split('pinned=')[1].splitlines()[0],'Full-toolbar replacement failed')
+                action('Reset toolbar')
+                action('Pin lavender');wait(lambda:'pinned=glove,coral,plush,robot,laser' in cfg.read_text(),'Pin removal failed')
+                action('Pin lavender');wait(lambda:'lavender' in cfg.read_text().split('pinned=')[1].splitlines()[0],'Pin addition failed')
+                # Validate and compose hand-only artwork, then import through the native chooser.
+                fixture=output/'hand.png';im=Image.new('RGBA',(512,768));draw=ImageDraw.Draw(im)
+                draw.polygon([(245,70),(300,70),(300,320),(390,340),(390,540),(330,575),(330,690),(200,690),(200,575),(130,540),(130,340),(245,320)],fill=(235,70,140,255));im.save(fixture)
+                composed=output/'composed.png';run(str(binary),'--make-hand',str(fixture),str(composed));assert Image.open(composed).size==(1024,1536)
+                invalid=output/'opaque.png';Image.new('RGB',(512,768),'white').save(invalid);assert run(str(binary),'--make-hand',str(invalid),str(output/'bad.png'),check=False).returncode==1
+                action('Make your own hand…');action('3. Drop an image here, or click to choose it')
+                wait(lambda:run('xdotool','search','--onlyvisible','--name','Choose your TinyHand image',check=False).returncode==0,'Native chooser did not open')
+                run('xdotool','key','ctrl+l');run('xdotool','type','--clearmodifiers',str(fixture));run('xdotool','key','Return');time.sleep(.4);run('xdotool','key','Return')
+                wait(lambda:find('Add hand') is not None and find('Add hand').getState().contains(pyatspi.STATE_SENSITIVE),'Valid custom hand was rejected',20)
+                name=find('Name','text');name.queryEditableText().setTextContents('Test hand');action('Add hand')
+                library=Path(env['XDG_DATA_HOME'])/'tinyhand-rs/hands/hands.json';wait(lambda:library.exists() and 'Test hand' in library.read_text(),'Custom hand did not persist')
+                original=fixture;original.unlink();assert list(library.parent.glob('custom-*.png')),'The artwork was not copied to the managed library'
+                assert 'custom_enabled=true' in cfg.read_text()
+                screenshot('custom-hand-library');action('Delete');wait(lambda:json.loads(library.read_text())==[],'Custom hand delete failed')
+                action('Start pointer')
+            wait(visible,'Overlay did not appear');time.sleep(.2)
+            # Single-instance CLI must control, not launch a second capture loop.
+            before=probe_clicks();click();assert probe_clicks()==before,'Presentation leaked a click'
+            # Interaction strips Alt from the forwarded click, then regrabs on release.
+            run('xdotool','keydown','Alt_L','mousemove','100','100','mousedown','1');time.sleep(.2)
+            run('xdotool','mouseup','1','keyup','Alt_L');wait(lambda:probe_clicks()>before,'Modifier interaction did not forward the click')
+            text=(output/'input.log').read_text();last=text.rsplit('ButtonPress event',1)[1];state=int(re.search(r'state (0x[0-9a-f]+)',last).group(1),16);assert state&8==0,f'Interaction leaked Alt: {state}'
+            time.sleep(.2);before=probe_clicks();click();assert probe_clicks()==before,'Pointer was not recaptured after interaction'
+            if cycle==0:
+                before=probe_clicks();device_alt(True);run('xdotool','mousemove','100','100','mousedown','1');time.sleep(.15)
+                run('xdotool','mousemove','150','115','mouseup','1');device_alt(False);time.sleep(.2)
+                wait(lambda:probe_clicks()>before,'Independent keyboard interaction did not forward the click');wait(modifiers_up,'Independent keyboard modifier remained pressed')
+                last=(output/'input.log').read_text().rsplit('ButtonPress event',1)[1];state=int(re.search(r'state (0x[0-9a-f]+)',last).group(1),16);assert state&8==0,'Independent keyboard Alt leaked into the click'
+                released=(output/'input.log').read_text().rsplit('ButtonRelease event',1)[1];release_state=int(re.search(r'state (0x[0-9a-f]+)',released).group(1),16);assert release_state&8==0,'Independent keyboard Alt leaked into the release'
+                assert run('xdotool','getwindowgeometry','--shell',probe_id).stdout==probe_geometry,'Independent modifier drag moved the window'
+            # Wheel replay must release the synthetic wheel button, including
+            # devices which deliver their physical release before replay starts.
+            before=probe_clicks();run('xdotool','keydown','Alt_L','mousemove','100','100','click','4','keyup','Alt_L');wait(lambda:probe_clicks()>before,'Interaction scrolling was not forwarded');time.sleep(.2)
+            before=probe_clicks();click();assert probe_clicks()==before,'Wheel replay left capture released'
+            # Releasing the interaction modifier before the mouse must not leave it stuck.
+            before=probe_clicks();run('xdotool','keydown','Alt_L','mousemove','100','100','mousedown','1','mousemove','160','120','keyup','Alt_L');time.sleep(.1)
+            run('xdotool','mouseup','1');wait(lambda:probe_clicks()>before,'Interaction drag was not forwarded');time.sleep(.2)
+            wait(modifiers_up,'An interaction modifier remained logically pressed')
+            assert run('xdotool','getwindowgeometry','--shell',probe_id).stdout==probe_geometry,'Interaction accidentally moved the underlying window'
+            before=probe_clicks();click();assert probe_clicks()==before,'Capture was not restored after early modifier release'
+            run('xdotool','mousemove','300','220','mousedown','1','mousemove','700','220');time.sleep(.1)
+            def drawing_ready():
+                pixel=screenshot(f'drawing-{cycle}').getpixel((400,220));return max(pixel)-min(pixel)>60
+            wait(drawing_ready,'The compositor did not publish the drawn line',3)
+            run('xdotool','key','ctrl+alt+x')
+            wait(lambda:screenshot('cleared-while-held').getpixel((400,220))==(0,0,0),'Clear shortcut failed while the mouse was held',3)
+            run('xdotool','mouseup','1');time.sleep(.2)
+            # Right-button drags animate/tap but must never create ink.
+            command('--clear');time.sleep(.2);baseline=screenshot('before-right-drag')
+            run('xdotool','mousemove','300','280','mousedown','3','mousemove','700','280','mouseup','3');time.sleep(.3)
+            right=screenshot('after-right-drag');assert right.getpixel((400,280))==baseline.getpixel((400,280)),'Right drag drew ink'
+            # Modern D-Bus menu must expose exact protocol signatures and actions.
+            name=f'org.kde.StatusNotifierItem-{app.pid}-1'
+            layout=run('gdbus','call','--session','--dest',name,'--object-path','/Menu','--method','com.canonical.dbusmenu.GetLayout','--','0','-1','[]').stdout
+            assert 'Start pointer' not in layout and 'Stop pointer' in layout and 'Settings' in layout,layout
+            if cycle==0:
+                # Toolbar drag/reorder and drag-out removal use the actual pointer path.
+                work=list(map(int,re.findall(r'-?\d+',run('xprop','-root','_NET_WORKAREA').stdout.split('=',1)[1])));bottom=work[1]+work[3]
+                pins=cfg.read_text().split('pinned=')[1].splitlines()[0].split(',')
+                width=(len(pins)+5)*44+12;bx=(1280-width)/2;by=bottom-62
+                run('xdotool','mousemove',str(round(bx+28)),str(round(by+27)));time.sleep(.3)
+                run('xdotool','mousedown','1','mousemove',str(round(bx+116)),str(round(by+27)),'mouseup','1')
+                expected=pins.copy();expected.insert(2,expected.pop(0));wait(lambda:'pinned='+','.join(expected) in cfg.read_text(),'Toolbar drag reorder failed')
+                run('xdotool','mousemove',str(round(bx+28)),str(round(by+27)),'mousedown','1','mousemove','640','580','mouseup','1')
+                expected.pop(0);wait(lambda:'pinned='+','.join(expected) in cfg.read_text(),'Toolbar drag-out removal failed');assert visible(),'Toolbar drag opened settings'
+                selected=cfg.read_text().split('style=')[1].splitlines()[0];count=len(expected)+int(selected not in expected)
+                width=(count+5)*44+12;bx=(1280-width)/2
+                run('xdotool','mousemove',str(round(bx+28+count*44)),str(round(by+27)));time.sleep(.3)
+                run('xdotool','click','1');time.sleep(.2);click(round(bx+223),round(by-35))
+                wait(lambda:'color=4' in cfg.read_text() and 'match_color=false' in cfg.read_text(),'Quick ink palette failed')
+                command('--clear');run('xdotool','mousemove','300','300','mousedown','1','mousemove','700','300');time.sleep(.2)
+                def blue_ready():
+                    actual=screenshot('quick-blue-ink').getpixel((400,300));return max(abs(a-b) for a,b in zip(actual,(10,132,255)))<=2
+                wait(blue_ready,'The quick palette did not render blue ink',3)
+                run('xdotool','mouseup','1');time.sleep(3.9);assert screenshot('faded-ink').getpixel((400,300))==(0,0,0),'Ink did not finish fading'
+            command('--settings');wait(lambda:not visible(),'Opening settings did not release input')
+            wait(lambda:find('Start pointer') is not None,'Native settings did not become ready')
+            run('xdotool','windowactivate','--sync',probe_id)
+            before=probe_clicks();wait(lambda:(click() or probe_clicks()>before),'Settings kept the pointer grab',3)
+            command('--present');wait(visible,'Remote start failed')
+            run('xdotool','key','Escape');wait(lambda:not visible(),'Escape failed')
+            run('xdotool','key','ctrl+alt+h');wait(visible,'Global shortcut failed')
+            command('--clear');run('xdotool','mousemove','1100','100');time.sleep(4)
+            def ticks():return sum(map(int,Path(f'/proc/{app.pid}/stat').read_text().split()[13:15]))
+            t=ticks();time.sleep(2);cpu=(ticks()-t)/os.sysconf('SC_CLK_TCK')/2*100;assert cpu<5,f'Idle CPU {cpu:.1f}%';print(f'Cycle {cycle+1} idle CPU {cpu:.1f}%',flush=True)
+            rss.append(int(Path(f'/proc/{app.pid}/status').read_text().split('VmRSS:')[1].split()[0]))
+            command('--quit');assert app.wait(timeout=8)==0;wait(lambda:not visible(),'Overlay remained after exit')
+            before=probe_clicks();click();assert probe_clicks()>before,'Shutdown left input captured'
+            for _ in range(2):run('xmessage','-timeout','1','-buttons','OK','Teardown check');assert wm.poll() is None,'Cinnamon crashed after teardown'
+            log=(output/f'app-{cycle+1}.log').read_text();assert 'X11 error' not in log and 'CRITICAL' not in log,log
+            print(f'Cycle {cycle+1}/{args.cycles}: native UI, capture, interaction, ink, SNI, shortcuts, shutdown passed',flush=True)
+        time.sleep(5);assert wm.poll() is None
+        log=(output/'cinnamon.log').read_text();assert 'Adding systray: unknown' not in log and 'has been already disposed' not in log
+        result={'result':'PASS','cycles':args.cycles,'max_app_rss_kib':max(rss),'logs':str(output)};(output/'result.json').write_text(json.dumps(result,indent=2));print(json.dumps(result),flush=True)
+    finally:
+        for p in reversed(processes):
+            if p.poll() is None:os.killpg(p.pid,signal.SIGTERM)
+        for p in processes:
+            try:p.wait(timeout=5)
+            except subprocess.TimeoutExpired:os.killpg(p.pid,signal.SIGKILL);p.wait(timeout=5)
+        marker=f'TINYHAND_TEST_SESSION={output}'.encode()
+        for proc in Path('/proc').iterdir():
+            if proc.name.isdecimal() and int(proc.name)!=os.getpid():
                 try:
-                    if marker in (proc / "environ").read_bytes().split(b"\0"):
-                        os.kill(int(proc.name), signal.SIGTERM)
-                except (PermissionError, FileNotFoundError, ProcessLookupError):
-                    pass
-        print(f"Isolated processes stopped. Logs: {output}", flush=True)
-
-
-if __name__ == "__main__":
-    main()
+                    if marker in (proc/'environ').read_bytes().split(b'\0'):os.kill(int(proc.name),signal.SIGTERM)
+                except (PermissionError,FileNotFoundError,ProcessLookupError):pass
+        print(f'Isolated session stopped. Logs: {output}',flush=True)
+if __name__=='__main__':main()

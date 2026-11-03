@@ -44,7 +44,7 @@ impl HandPose {
         tilt: f64,
         press: f64,
     ) -> Self {
-        let height = (size * screen_h).clamp(45.0, 250.0) * (1.0 - 0.06 * press);
+        let height = (size * screen_h).clamp(30.0, screen_h * 0.35) * (1.0 - 0.06 * press);
         let scale = height / (asset.wrist - asset.top).max(1.0);
         let dx = grip.x - cursor.x;
         let dy = grip.y - cursor.y;

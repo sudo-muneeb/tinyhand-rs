@@ -1,100 +1,22 @@
+use gtk::prelude::*;
 use std::ffi::{CStr, CString};
 use std::ptr;
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
-use std::sync::mpsc::{self, Receiver};
+use std::sync::mpsc::{self, Receiver, Sender};
 use std::time::{Duration, Instant};
 use tinyhand_rs::config::{self, Config};
 use tinyhand_rs::ffi::*;
 use tinyhand_rs::ink::{Brush, Ink, Point};
 use tinyhand_rs::render::{asset_dir, Renderer};
-use tinyhand_rs::settings::{self, Action, SettingsUi};
 use tinyhand_rs::sound::Sound;
+use tinyhand_rs::{
+    desktop::{self, Event},
+    hands::Library,
+    native_settings::SettingsWindow,
+};
 
 static STOP: AtomicBool = AtomicBool::new(false);
 static LAST_X_ERROR: AtomicU8 = AtomicU8::new(0);
-
-fn cinnamon_session() -> bool {
-    is_cinnamon_desktop(
-        &std::env::var("XDG_CURRENT_DESKTOP").unwrap_or_default(),
-        &std::env::var("DESKTOP_SESSION").unwrap_or_default(),
-    )
-}
-
-fn is_cinnamon_desktop(current: &str, session: &str) -> bool {
-    current.split(':').any(|desktop| {
-        desktop.eq_ignore_ascii_case("cinnamon") || desktop.eq_ignore_ascii_case("x-cinnamon")
-    }) || session.eq_ignore_ascii_case("cinnamon")
-}
-
-fn is_muffin_name(name: &str) -> bool {
-    let name = name.to_ascii_lowercase();
-    name.contains("muffin") || name.contains("cinnamon")
-}
-
-// Check the actual X11 window manager too: desktop environment variables can
-// be absent or stale in terminals, launchers, and nested sessions.
-unsafe fn muffin_window_manager(display: *mut Display, root: Window) -> bool {
-    let mut actual_type = 0;
-    let mut format = 0;
-    let mut count = 0;
-    let mut remaining = 0;
-    let mut data = ptr::null_mut();
-    let check = XInternAtom(display, c"_NET_SUPPORTING_WM_CHECK".as_ptr(), 0);
-    let status = XGetWindowProperty(
-        display,
-        root,
-        check,
-        0,
-        1,
-        0,
-        33,
-        &mut actual_type,
-        &mut format,
-        &mut count,
-        &mut remaining,
-        &mut data,
-    );
-    let wm = if status == 0 && actual_type == 33 && format == 32 && count == 1 && !data.is_null() {
-        *data.cast::<Window>()
-    } else {
-        0
-    };
-    if !data.is_null() {
-        XFree(data.cast());
-    }
-    if wm == 0 {
-        return false;
-    }
-    data = ptr::null_mut();
-    let name = XInternAtom(display, c"_NET_WM_NAME".as_ptr(), 0);
-    let utf8 = XInternAtom(display, c"UTF8_STRING".as_ptr(), 0);
-    let status = XGetWindowProperty(
-        display,
-        wm,
-        name,
-        0,
-        256,
-        0,
-        utf8,
-        &mut actual_type,
-        &mut format,
-        &mut count,
-        &mut remaining,
-        &mut data,
-    );
-    let muffin = status == 0
-        && actual_type == utf8
-        && format == 8
-        && !data.is_null()
-        && is_muffin_name(&String::from_utf8_lossy(std::slice::from_raw_parts(
-            data,
-            count as usize,
-        )));
-    if !data.is_null() {
-        XFree(data.cast());
-    }
-    muffin
-}
 
 // EWMH work areas exclude desktop panels and docks. Read only the active
 // desktop's four CARDINALs, keeping the property allocation bounded.
@@ -162,6 +84,14 @@ extern "C" fn stop_signal(_: i32) {
 extern "C" fn x_error(_: *mut Display, error: *mut XErrorEvent) -> i32 {
     unsafe {
         LAST_X_ERROR.store((*error).error_code, Ordering::SeqCst);
+        tinyhand_rs::logging::write(
+            "x11_error",
+            &format!(
+                "code={} request={}",
+                (*error).error_code,
+                (*error).request_code
+            ),
+        );
         eprintln!(
             "tinyhand-rs: X11 error {} on request {}",
             (*error).error_code,
@@ -179,9 +109,10 @@ struct App {
     display: *mut Display,
     root: Window,
     window: Window,
-    tray: Window,
     cmap: Colormap,
     invisible: Cursor,
+    arrow: Cursor,
+    interaction_cursor: bool,
     renderer: Renderer,
     config: Config,
     ink: Ink,
@@ -189,14 +120,26 @@ struct App {
     cursor: Point,
     pressed: Option<Instant>,
     active: bool,
-    settings: SettingsUi,
-    import_rx: Option<Receiver<Result<Option<String>, String>>>,
+    tx: Sender<Event>,
+    rx: Receiver<Event>,
+    preferences: SettingsWindow,
+    library: Library,
+    hotkeys_suspended: bool,
+    preparing: bool,
+    trace: bool,
+    status_item: Option<tinyhand_rs::tray::Tray>,
+    input: tinyhand_rs::input::Input,
+    passing: bool,
+    restore_at: Option<Instant>,
+    cursor_hidden: bool,
+    revealed: Instant,
+    hint_until: Instant,
+    toolbar_drag: Option<(String, Point)>,
+    instance: tinyhand_rs::instance::Instance,
     page: usize,
-    capture: Option<bool>,
     quit: bool,
-    docked: bool,
-    last_dock: Instant,
     monitors: Vec<(i32, i32, i32, i32)>,
+    active_monitor: Option<(i32, i32, i32, i32)>,
     work_area: Option<(i32, i32, i32, i32)>,
     last_monitor_check: Instant,
     toggle_key: (i32, u32),
@@ -211,8 +154,9 @@ fn shortcut(display: *mut Display, value: &str) -> (i32, u32) {
     let mut mods = 0;
     for bit in &bits[..bits.len() - 1] {
         match bit.to_ascii_lowercase().as_str() {
-            "control" => mods |= 4,
-            "alt" => mods |= 8,
+            "control" | "ctrl" => mods |= 4,
+            "alt" | "option" => mods |= 8,
+            "super" | "command" | "meta" => mods |= 64,
             "shift" => mods |= 1,
             _ => {}
         }
@@ -226,7 +170,7 @@ fn shortcut(display: *mut Display, value: &str) -> (i32, u32) {
 }
 
 impl App {
-    unsafe fn new() -> Result<Self, String> {
+    unsafe fn new(instance: tinyhand_rs::instance::Instance) -> Result<Self, String> {
         XSetErrorHandler(Some(x_error));
         let display = XOpenDisplay(ptr::null());
         if display.is_null() {
@@ -234,10 +178,6 @@ impl App {
         }
         let screen = XDefaultScreen(display);
         let root = XRootWindow(display, screen);
-        let disable_tray = cinnamon_session() || muffin_window_manager(display, root);
-        if disable_tray {
-            eprintln!("tinyhand-rs: legacy tray disabled on Cinnamon/Muffin; use Ctrl+Alt+H to toggle and Escape to release the pointer");
-        }
         let w = XDisplayWidth(display, screen);
         let h = XDisplayHeight(display, screen);
         let mut vi = XVisualInfo::default();
@@ -281,67 +221,48 @@ impl App {
         }
         XStoreName(display, window, c"TinyHand overlay".as_ptr());
         XShapeCombineRectangles(display, window, 2, 0, 0, ptr::null(), 0, 0, 0);
-        let mut tray_attrs = XSetWindowAttributes {
-            colormap: cmap,
-            border_pixel: 0,
-            event_mask: (1 << 15) | (1 << 2),
-            ..Default::default()
-        };
-        let tray = if disable_tray {
-            0
-        } else {
-            let tray = XCreateWindow(
-                display,
-                root,
-                0,
-                0,
-                26,
-                26,
-                0,
-                32,
-                1,
-                vi.visual,
-                (1 << 3) | (1 << 11) | (1 << 13),
-                &mut tray_attrs,
-            );
-            XStoreName(
-                display,
-                tray,
-                c"TinyHand: left toggle, right settings, middle quit".as_ptr(),
-            );
-            let embed = XInternAtom(display, c"_XEMBED_INFO".as_ptr(), 0);
-            let info: [usize; 2] = [0, 1];
-            XChangeProperty(display, tray, embed, embed, 32, 0, info.as_ptr().cast(), 2);
-            tray
-        };
         XSelectInput(display, root, 1 << 17);
         let bitmap = XCreateBitmapFromData(display, root, c"".as_ptr(), 1, 1);
         let mut black = XColor::default();
         let invisible = XCreatePixmapCursor(display, bitmap, bitmap, &mut black, &mut black, 0, 0);
         XFreePixmap(display, bitmap);
-        let config = Config::load(&Config::path());
-        let renderer =
-            match Renderer::new(display, window, vi.visual, w, h, asset_dir()?, config.style) {
-                Ok(r) => r,
-                Err(e) => {
-                    XDestroyWindow(display, window);
-                    if tray != 0 {
-                        XDestroyWindow(display, tray);
-                    }
-                    XFreeColormap(display, cmap);
-                    XCloseDisplay(display);
-                    return Err(e);
-                }
-            };
+        let mut config = Config::load(&Config::path());
+        let library = Library::load();
+        config
+            .pinned
+            .retain(|id| !id.starts_with("custom-") || library.hand(id).is_some());
+        if config.pinned.is_empty() {
+            config.pinned = config::default_pins();
+        }
+        if let Some(hand) = library.hand(&config.custom_id) {
+            config.custom_path = Library::path(&hand.id).to_string_lossy().into_owned();
+        }
+        let (tx, rx) = mpsc::channel();
+        let preferences = SettingsWindow::new(tx.clone());
+        let status_item = tinyhand_rs::tray::Tray::new(tx.clone())
+            .map_err(|e| eprintln!("Status notifier: {e}"))
+            .ok();
+        let renderer = match Renderer::new(display, window, vi.visual, w, h, asset_dir()?, &config)
+        {
+            Ok(r) => r,
+            Err(e) => {
+                XDestroyWindow(display, window);
+                XFreeColormap(display, cmap);
+                XCloseDisplay(display);
+                return Err(e);
+            }
+        };
         let toggle_key = shortcut(display, &config.toggle);
         let clear_key = shortcut(display, &config.clear);
+        let input = tinyhand_rs::input::Input::new(display, root)?;
         let mut app = Self {
             display,
             root,
             window,
-            tray,
             cmap,
             invisible,
+            arrow: XCreateFontCursor(display, 68),
+            interaction_cursor: false,
             renderer,
             config,
             ink: Ink::new(),
@@ -352,14 +273,26 @@ impl App {
             },
             pressed: None,
             active: false,
-            settings: SettingsUi::default(),
-            import_rx: None,
+            tx,
+            rx,
+            preferences,
+            library,
+            hotkeys_suspended: false,
+            preparing: false,
+            trace: std::env::var_os("TINYHAND_TRACE_INPUT").is_some(),
+            status_item,
+            input,
+            passing: false,
+            restore_at: None,
+            cursor_hidden: false,
+            revealed: Instant::now(),
+            hint_until: Instant::now(),
+            toolbar_drag: None,
+            instance,
             page: 0,
-            capture: None,
             quit: false,
-            docked: false,
-            last_dock: Instant::now() - Duration::from_secs(2),
             monitors: vec![(0, 0, w, h)],
+            active_monitor: None,
             work_area: None,
             last_monitor_check: Instant::now(),
             toggle_key,
@@ -372,71 +305,47 @@ impl App {
             app.config.custom_enabled = false;
             app.renderer.select_config(&app.config)?;
         }
+        if app.config.custom_enabled && app.config.custom_id.is_empty() {
+            if let Ok(png) = std::fs::read(&app.config.custom_path) {
+                let (r, g, b) = app.renderer.ink_color(&Config {
+                    match_color: true,
+                    ..app.config.clone()
+                });
+                let ink =
+                    ((r * 255.0) as u32) << 16 | ((g * 255.0) as u32) << 8 | (b * 255.0) as u32;
+                match app.library.add(tinyhand_rs::hands::PreparedHand {
+                    png,
+                    ink,
+                    name: "Imported hand".into(),
+                }) {
+                    Ok(id) => {
+                        app.config.custom_path = Library::path(&id).to_string_lossy().into_owned();
+                        app.config.custom_id = id.clone();
+                        if app.config.pinned.len() < 8 {
+                            app.config.pinned.push(id);
+                        }
+                        app.save();
+                        let _ = app.renderer.select_config(&app.config);
+                    }
+                    Err(e) => tinyhand_rs::logging::write("legacy_import", &e),
+                }
+            }
+        }
+        if app.config.custom_enabled {
+            if let Some(hand) = app.library.hand(&app.config.custom_id) {
+                app.renderer.set_custom_ink(hand.ink);
+            }
+        }
+        app.renderer.warm_toolbar(&app.config);
         app.register_keys();
         XSync(display, 0);
         app.query_pointer();
         app.refresh_monitors();
-        app.dock_tray();
         Ok(app)
     }
 
-    unsafe fn dock_tray(&mut self) {
-        self.last_dock = Instant::now();
-        if self.docked || self.tray == 0 {
-            return;
-        }
-        let name = format!("_NET_SYSTEM_TRAY_S{}", XDefaultScreen(self.display));
-        let name = CString::new(name).expect("atom");
-        let selection = XInternAtom(self.display, name.as_ptr(), 0);
-        let owner = XGetSelectionOwner(self.display, selection);
-        if owner == 0 {
-            return;
-        }
-        let opcode = XInternAtom(self.display, c"_NET_SYSTEM_TRAY_OPCODE".as_ptr(), 0);
-        let mut message = XEvent {
-            client: XClientMessageEvent {
-                type_: 33,
-                serial: 0,
-                send_event: 1,
-                display: self.display,
-                window: owner,
-                message_type: opcode,
-                format: 32,
-                data: [0, 0, self.tray as i64, 0, 0],
-            },
-        };
-        XSendEvent(self.display, owner, 0, 0, &mut message);
-        XMapRaised(self.display, self.tray);
-        self.docked = true;
-        self.paint_tray();
-        XFlush(self.display);
-    }
-
-    unsafe fn paint_tray(&self) {
-        let mut vi = XVisualInfo::default();
-        if XMatchVisualInfo(self.display, XDefaultScreen(self.display), 32, 4, &mut vi) == 0 {
-            return;
-        }
-        let surface = cairo_xlib_surface_create(self.display, self.tray, vi.visual, 26, 26);
-        let c = cairo_create(surface);
-        cairo_set_operator(c, 0);
-        cairo_paint(c);
-        cairo_set_operator(c, 2);
-        cairo_set_source_rgba(c, if self.active { 0.77 } else { 0.62 }, 0.46, 0.91, 1.0);
-        cairo_arc(c, 13.0, 13.0, 11.0, 0.0, std::f64::consts::TAU);
-        cairo_fill(c);
-        cairo_set_source_rgba(c, 1.0, 1.0, 1.0, 1.0);
-        cairo_set_line_width(c, 2.0);
-        cairo_move_to(c, 6.0, 17.0);
-        cairo_line_to(c, 14.0, 7.0);
-        cairo_stroke(c);
-        cairo_arc(c, 15.0, 7.0, 3.5, 0.0, std::f64::consts::TAU);
-        cairo_fill(c);
-        cairo_destroy(c);
-        cairo_surface_destroy(surface);
-    }
-
-    unsafe fn register_keys(&self) {
+    unsafe fn register_keys(&self) -> bool {
+        let mut success = true;
         for (name, (key, mods)) in [
             (&self.config.toggle, self.toggle_key),
             (&self.config.clear, self.clear_key),
@@ -446,12 +355,12 @@ impl App {
                 XGrabKey(self.display, key, mods | extra, self.root, 0, 1, 1);
                 XSync(self.display, 0);
                 if LAST_X_ERROR.load(Ordering::SeqCst) == 10 {
-                    eprintln!(
-                        "tinyhand-rs: shortcut {name} with lock mask {extra} is already in use"
-                    );
+                    eprintln!("tinyhand-rs: shortcut {name} is already in use");
+                    success = false;
                 }
             }
         }
+        success
     }
     unsafe fn unregister_keys(&self) {
         for (key, mods) in [self.toggle_key, self.clear_key] {
@@ -461,7 +370,7 @@ impl App {
         }
     }
 
-    unsafe fn query_pointer(&mut self) {
+    unsafe fn query_pointer(&mut self) -> u32 {
         let (mut r, mut child, mut rx, mut ry, mut x, mut y, mut mask) = (0, 0, 0, 0, 0, 0, 0);
         if XQueryPointer(
             self.display,
@@ -480,6 +389,7 @@ impl App {
                 y: ry as f64,
             };
         }
+        mask
     }
 
     unsafe fn refresh_monitors(&mut self) {
@@ -517,13 +427,27 @@ impl App {
             })
             .copied()
             .unwrap_or(self.monitors[0]);
+        if self.active_monitor.is_some_and(|old| old != m) {
+            self.ink.clear();
+            self.renderer.pointer_up();
+            self.toolbar_drag = None;
+        }
+        self.active_monitor = Some(m);
+        self.renderer.toolbar_width = tinyhand_rs::toolbar::width(&self.config);
         self.renderer.place_bar_with_work_area(m, self.work_area);
+        if let Err(e) = unsafe { self.renderer.select_config(&self.config) } {
+            tinyhand_rs::logging::write("asset", &e);
+        }
     }
 
     unsafe fn activate(&mut self) -> Result<(), String> {
         if self.active {
             return Ok(());
         }
+        if std::env::var("XDG_SESSION_TYPE").as_deref() == Ok("wayland") {
+            return Err("Presentation needs an X11 login session. XWayland cannot capture input across Wayland applications.".into());
+        }
+        self.renderer.warm_toolbar(&self.config);
         // PointerMotionHintMask would suppress subsequent movement until an
         // XQueryPointer acknowledgement. Request ordinary motion events;
         // run() already bounds event batches and rendering frequency.
@@ -534,7 +458,17 @@ impl App {
                 "XGrabPointer failed ({status}). Another program may have captured the pointer."
             ));
         }
+        self.input.buttons = 0;
+        self.interaction_cursor = false;
         self.active = true;
+        tinyhand_rs::logging::write("presentation", "started");
+        if self.config.tap_sound_enabled() {
+            self.sound.warm();
+        }
+        self.revealed = Instant::now() + Duration::from_secs(3);
+        self.hint_until = Instant::now() + Duration::from_secs(9);
+        self.renderer.toolbar_alpha = 1.0;
+        self.renderer.hint = true;
         self.query_pointer();
         self.place_bar();
         self.renderer.invalidate();
@@ -551,8 +485,8 @@ impl App {
             }
         }
         XMapRaised(self.display, self.window);
-        if self.docked {
-            self.paint_tray();
+        if let Some(tray) = &self.status_item {
+            tray.set_active(self.active);
         }
         self.draw();
         XFlush(self.display);
@@ -564,14 +498,21 @@ impl App {
             return;
         }
         self.active = false;
+        tinyhand_rs::logging::write("presentation", "stopped");
+        self.input.restore(self.display);
+        self.passing = false;
+        self.restore_at = None;
+        if self.cursor_hidden {
+            tinyhand_rs::input::XFixesShowCursor(self.display, self.root);
+            self.cursor_hidden = false;
+        }
+        self.renderer.pointer_visible = true;
         self.renderer.reset_motion();
         self.redraw_pending = false;
         self.pressed = None;
         self.ink.end(Instant::now());
         self.ink.clear();
-        self.settings.open = false;
         self.page = 0;
-        self.capture = None;
         XUngrabKeyboard(self.display, 0);
         XUngrabPointer(self.display, 0);
         let escape = XKeysymToKeycode(self.display, 0xff1b) as i32;
@@ -579,8 +520,8 @@ impl App {
             XUngrabKey(self.display, escape, extra, self.root);
         }
         XUnmapWindow(self.display, self.window);
-        if self.docked {
-            self.paint_tray();
+        if let Some(tray) = &self.status_item {
+            tray.set_active(self.active);
         }
         XFlush(self.display);
     }
@@ -593,213 +534,277 @@ impl App {
 
     unsafe fn render(&mut self, now: Instant) {
         if self.active && self.redraw_pending {
+            let begin = Instant::now();
             self.renderer.paint(
                 &self.config,
                 &self.ink,
                 self.cursor,
-                (
-                    SettingsUi {
-                        capture: self.capture,
-                        ..self.settings
-                    },
-                    self.page,
-                ),
+                self.page,
                 self.pressed,
                 now,
             );
             XFlush(self.display);
+            if self.trace {
+                eprintln!(
+                    "frame at {},{} took {}ms, strokes={}",
+                    self.cursor.x,
+                    self.cursor.y,
+                    begin.elapsed().as_millis(),
+                    self.ink.strokes.len()
+                );
+            }
             self.last_render = now;
             self.redraw_pending = false;
         }
     }
 
-    fn bar_hit(&self, p: Point) -> Option<usize> {
-        let x = (p.x - self.renderer.bar_x) / self.renderer.ui_scale;
-        let y = (p.y - self.renderer.bar_y) / self.renderer.ui_scale;
-        if !(0.0..=54.0).contains(&y) || !(0.0..488.0).contains(&x) {
+    fn bar_hit(&self, p: Point) -> Option<tinyhand_rs::toolbar::Item> {
+        if self.renderer.toolbar_alpha < 0.2 {
             return None;
         }
-        let mut edge = 0.0;
-        for (i, width) in [42.0, 42.0, 86.0, 95.0, 66.0, 96.0, 61.0]
-            .iter()
-            .enumerate()
-        {
-            edge += width;
-            if x < edge {
-                return Some(i);
-            }
-        }
-        None
+        tinyhand_rs::toolbar::hit(
+            &self.config,
+            (p.x - self.renderer.bar_x) / self.renderer.ui_scale,
+            (p.y - self.renderer.bar_y) / self.renderer.ui_scale,
+        )
     }
-    fn grid_hit(&self, p: Point) -> Option<usize> {
-        if self.page == 0 || self.settings.open {
-            return None;
-        }
-        let x = (p.x - self.renderer.bar_x) / self.renderer.ui_scale - 17.0;
-        let y = (p.y - self.renderer.bar_y) / self.renderer.ui_scale + 336.0 - 42.0;
-        if x < 0.0 || y < 0.0 || x >= 468.0 || y >= 288.0 {
-            return None;
-        }
-        let idx = (self.page - 1) * 36 + (y / 48.0) as usize * 6 + (x / 78.0) as usize;
-        (idx < 37).then_some(idx)
-    }
-    unsafe fn settings_hit(&mut self, p: Point) -> bool {
-        if !self.settings.open {
-            return false;
-        }
-        let x = (p.x - self.renderer.settings_x) / self.renderer.settings_scale;
-        let y = (p.y - self.renderer.settings_y) / self.renderer.settings_scale;
-        if !settings::contains(x, y, (0.0, 0.0, settings::WIDTH, settings::HEIGHT)) {
-            return false;
-        }
-        if let Some(action) = settings::hit(x, y, self.settings) {
-            self.settings_action(action);
-        }
-        true
+    unsafe fn open_settings(&mut self) {
+        self.deactivate();
+        self.preferences.show(&self.config, &self.library);
     }
 
-    unsafe fn settings_action(&mut self, action: Action) {
-        match action {
-            Action::Close => self.settings.open = false,
-            Action::Tab(tab) => {
-                self.settings.tab = tab;
-                self.settings.custom = false;
-            }
-            Action::Custom => self.settings.custom = true,
-            Action::Back => self.settings.custom = false,
-            Action::UseCustom => {
-                if !self.config.custom_path.is_empty() {
-                    self.config.custom_enabled = true;
-                }
-            }
-            Action::Style(style) => {
-                self.config.style = style;
-                self.config.custom_enabled = false;
-            }
-            Action::Reset => {
-                self.config.style = 0;
-                self.config.custom_enabled = false;
-            }
-            Action::Startup => {
-                self.config.startup = !self.config.startup;
-                if let Ok(exe) = std::env::current_exe() {
-                    if let Err(e) = config::update_autostart(self.config.startup, &exe) {
-                        eprintln!("Autostart: {e}");
-                    }
-                }
-            }
-            Action::Capture(toggle) => {
-                self.capture = Some(toggle);
-                if XGrabKeyboard(self.display, self.root, 0, 1, 1, 0) != 0 {
-                    self.capture = None;
-                }
-            }
-            Action::Size(step) => {
-                self.config.size = (self.config.size + step * 0.01).clamp(0.05, 0.35)
-            }
-            Action::Angle(step) => {
-                self.config.angle = (self.config.angle + step * 0.08).clamp(-1.2, 1.2)
-            }
-            Action::Opacity(step) => {
-                self.config.opacity = (self.config.opacity + step * 0.1).clamp(0.2, 1.0)
-            }
-            Action::Shadow => self.config.shadow = !self.config.shadow,
-            Action::Thickness(step) => {
-                self.config.thickness = (self.config.thickness + step).clamp(1.0, 30.0)
-            }
-            Action::Fade(step) => {
-                self.config.fade = (self.config.fade + step * 0.5).clamp(0.3, 20.0)
-            }
-            Action::Color(color) => {
-                self.config.color = color;
-                self.config.match_color = false;
-            }
-            Action::MatchColor => self.config.match_color = true,
-            Action::Sound(kind) => {
-                self.config.sound = kind > 0;
-                if kind > 0 {
-                    self.config.sound_kind = kind;
-                    self.sound.tap(self.config.volume, kind);
-                }
-            }
-            Action::Volume(step) => {
-                self.config.volume = (self.config.volume + step * 0.1).clamp(0.0, 1.0)
-            }
-            Action::LaserSound => self.config.laser_sound = !self.config.laser_sound,
-            Action::Clear => self.ink.clear(),
-            Action::Import => {
-                self.choose_custom_hand();
-                return;
+    unsafe fn configure(&mut self, next: Config) {
+        let old = self.config.clone();
+        self.unregister_keys();
+        self.config = next;
+        self.toggle_key = shortcut(self.display, &self.config.toggle);
+        self.clear_key = shortcut(self.display, &self.config.clear);
+        if self.toggle_key == self.clear_key || !self.register_keys() {
+            self.unregister_keys();
+            self.config.toggle = old.toggle.clone();
+            self.config.clear = old.clear.clone();
+            self.toggle_key = shortcut(self.display, &self.config.toggle);
+            self.clear_key = shortcut(self.display, &self.config.clear);
+            self.register_keys();
+            self.preferences.show(&self.config, &self.library);
+            self.preferences
+                .message("That shortcut is already in use. The previous shortcuts were restored.");
+        }
+        if old.startup != self.config.startup {
+            if let Err(e) = std::env::current_exe()
+                .and_then(|exe| config::update_autostart(self.config.startup, &exe))
+            {
+                self.config.startup = old.startup;
+                self.preferences
+                    .message(&format!("Cannot change launch at login: {e}"));
             }
         }
         if let Err(e) = self.renderer.select_config(&self.config) {
-            eprintln!("{e}");
-            self.config.custom_enabled = false;
-            self.settings.notice = Some("The imported PNG is unavailable. Choose it again.");
+            self.config = old.clone();
             let _ = self.renderer.select_config(&self.config);
+            self.preferences.message(&e);
+        }
+        if self.config.custom_enabled {
+            if let Some(hand) = self.library.hand(&self.config.custom_id) {
+                self.renderer.set_custom_ink(hand.ink);
+            }
+        }
+        self.preferences.sync(&self.config);
+        if self.preferences.visible() && self.config.pinned != old.pinned {
+            self.preferences.show(&self.config, &self.library);
         }
         self.save();
         self.draw();
     }
 
-    unsafe fn choose_custom_hand(&mut self) {
-        // Release capture while the native chooser is open. Its subprocess
-        // runs off the event thread; the desktop remains usable throughout.
-        self.deactivate();
-        let (tx, rx) = mpsc::channel();
-        self.import_rx = Some(rx);
-        std::thread::spawn(move || {
-            let result = std::process::Command::new("zenity")
-                .args([
-                    "--file-selection",
-                    "--title=Choose your TinyHand PNG",
-                    "--file-filter=PNG images | *.png",
-                ])
-                .output()
-                .map_err(|e| format!("Cannot open the file chooser: {e}"))
-                .and_then(|out| {
-                    if !out.status.success() {
-                        return Ok(None);
-                    }
-                    let path = String::from_utf8(out.stdout).map_err(|e| e.to_string())?;
-                    Ok(Some(path.trim_end_matches(['\n', '\r']).to_owned()))
-                });
-            let _ = tx.send(result);
-        });
-    }
-
-    unsafe fn poll_import(&mut self) {
-        let Some(result) = self.import_rx.as_ref().and_then(|rx| rx.try_recv().ok()) else {
-            return;
-        };
-        self.import_rx = None;
-        let mut notice = None;
-        if let Ok(Some(path)) = &result {
-            let previous = self.config.clone();
-            self.config.custom_path = path.clone();
-            self.config.custom_enabled = true;
-            if let Err(e) = self.renderer.select_config(&self.config) {
-                eprintln!("Import: {e}");
-                notice = Some("Cannot read that PNG. Try another image.");
-                self.config = previous;
-            } else {
-                self.save();
+    unsafe fn desktop_event(&mut self, event: Event) {
+        match event {
+            Event::Configure(c) => self.configure(c),
+            Event::Pick(id) => {
+                let mut c = self.config.clone();
+                if let Some(index) = config::STYLES.iter().position(|s| *s == id) {
+                    c.style = index;
+                    c.custom_enabled = false;
+                } else if self.library.hand(&id).is_some() {
+                    c.custom_enabled = true;
+                    c.custom_id = id.clone();
+                    c.custom_path = Library::path(&id).to_string_lossy().into_owned();
+                } else {
+                    return;
+                }
+                self.configure(c);
             }
-        } else if let Err(e) = result {
-            eprintln!("Import: {e}");
-            notice = Some("Install zenity to choose a PNG file.");
+            Event::Swap(old, new) => {
+                if !self.config.pinned.contains(&new)
+                    && (config::STYLES.contains(&new.as_str()) || self.library.hand(&new).is_some())
+                {
+                    if let Some(slot) = self.config.pinned.iter().position(|p| *p == old) {
+                        self.config.pinned[slot] = new;
+                        self.save();
+                        if self.preferences.visible() {
+                            self.preferences.show(&self.config, &self.library);
+                        }
+                        self.draw();
+                    }
+                }
+            }
+            Event::Pin(id) => {
+                if self.config.pinned.len() >= 8 {
+                    self.preferences
+                        .message("The toolbar holds up to eight pointers. Remove one first.");
+                    return;
+                }
+                if !self.config.pinned.contains(&id)
+                    && (config::STYLES.contains(&id.as_str()) || self.library.hand(&id).is_some())
+                {
+                    self.config.pinned.push(id);
+                    self.save();
+                    if self.preferences.visible() {
+                        self.preferences.show(&self.config, &self.library);
+                    }
+                    self.draw();
+                }
+            }
+            Event::Unpin(id) => {
+                if self.config.pinned.len() > 1 {
+                    self.config.pinned.retain(|p| *p != id);
+                    self.save();
+                    if self.preferences.visible() {
+                        self.preferences.show(&self.config, &self.library);
+                    }
+                    self.draw();
+                } else {
+                    self.preferences
+                        .message("Keep at least one pointer in the toolbar.");
+                }
+            }
+            Event::Reorder(id, slot) => {
+                if let Some(index) = self.config.pinned.iter().position(|p| *p == id) {
+                    self.config.pinned.remove(index);
+                    let slot = slot.min(self.config.pinned.len());
+                    self.config.pinned.insert(slot, id);
+                    self.save();
+                    if self.preferences.visible() {
+                        self.preferences.show(&self.config, &self.library);
+                    }
+                    self.draw();
+                }
+            }
+            Event::Prepare(path, name) => {
+                if self.preparing {
+                    self.preferences
+                        .message("An image is still being prepared. Please wait.");
+                    return;
+                }
+                self.preparing = true;
+                self.preferences
+                    .message("Checking and preparing your hand…");
+                let tx = self.tx.clone();
+                std::thread::spawn(move || {
+                    let _ = tx.send(Event::Prepared(tinyhand_rs::hands::prepare(&path, &name)));
+                    gtk::glib::MainContext::default().wakeup();
+                });
+            }
+            Event::Prepared(result) => {
+                self.preparing = false;
+                match result {
+                    Ok(hand) => self.preferences.show_draft(hand),
+                    Err(e) => self.preferences.message(&e),
+                }
+            }
+            Event::AddHand(hand) => match self.library.add(hand) {
+                Ok(id) => {
+                    if self.config.pinned.len() < 8 {
+                        self.config.pinned.push(id.clone());
+                    }
+                    self.desktop_event(Event::Pick(id));
+                    self.preferences.show(&self.config, &self.library);
+                    self.preferences
+                        .message("Your hand is ready in the library.");
+                }
+                Err(e) => self.preferences.message(&e),
+            },
+            Event::RemoveHand(id) => match self.library.remove(&id) {
+                Ok(()) => {
+                    self.config.pinned.retain(|p| *p != id);
+                    if self.config.pinned.is_empty() {
+                        self.config.pinned.push("lavender".into());
+                    }
+                    if self.config.custom_id == id {
+                        self.config.custom_enabled = false;
+                        self.config.custom_id.clear();
+                        self.config.custom_path.clear();
+                        let _ = self.renderer.select_config(&self.config);
+                    }
+                    self.save();
+                    self.preferences.show(&self.config, &self.library);
+                }
+                Err(e) => self.preferences.message(&e),
+            },
+            Event::Toggle => {
+                if self.active {
+                    self.deactivate();
+                } else {
+                    self.desktop_event(Event::Start);
+                }
+            }
+            Event::Start => {
+                self.preferences.window.hide();
+                if let Err(e) = self.activate() {
+                    self.open_settings();
+                    self.preferences.message(&e);
+                }
+            }
+            Event::Stop => self.deactivate(),
+            Event::Settings => self.open_settings(),
+            Event::Quit => self.quit = true,
+            Event::Clear => {
+                self.ink.clear();
+                self.draw();
+            }
+            Event::Mute => {
+                if self.config.style == 36 && !self.config.custom_enabled {
+                    self.config.laser_sound = !self.config.laser_sound;
+                } else {
+                    self.config.sound = !self.config.sound;
+                }
+                self.save();
+                self.draw();
+            }
+            Event::Reset => {
+                let c = Config {
+                    startup: self.config.startup,
+                    welcomed: true,
+                    ..Config::default()
+                };
+                self.configure(c);
+                self.preferences.show(&self.config, &self.library);
+            }
+            Event::Message(s) => {
+                if let Some(kind) = s
+                    .strip_prefix("preview-sound:")
+                    .and_then(|n| n.parse::<usize>().ok())
+                {
+                    self.sound.tap(self.config.volume, kind);
+                } else {
+                    self.preferences.message(&s);
+                }
+            }
+            Event::SuspendHotkeys(yes) => {
+                self.hotkeys_suspended = yes;
+                if yes {
+                    self.unregister_keys();
+                } else {
+                    self.register_keys();
+                }
+            }
         }
-        if let Err(e) = self.activate() {
-            eprintln!("{e}");
+        if self.active {
+            self.place_bar();
         }
-        self.settings = SettingsUi {
-            open: true,
-            tab: 1,
-            custom: true,
-            capture: None,
-            notice,
-        };
-        self.draw();
+        if let Some(tray) = &self.status_item {
+            tray.set_active(self.active);
+        }
     }
 
     fn save(&self) {
@@ -811,9 +816,6 @@ impl App {
     unsafe fn press(&mut self, button: u32, p: Point) {
         self.cursor = p;
         self.place_bar();
-        if self.capture.take().is_some() {
-            XUngrabKeyboard(self.display, 0);
-        }
         if button == 4 || button == 5 {
             self.config.custom_enabled = false;
             self.config.style = (self.config.style + if button == 4 { 36 } else { 1 }) % 37;
@@ -824,160 +826,132 @@ impl App {
             self.draw();
             return;
         }
-        if button != 1 && button != 3 {
+        if !(1..=3).contains(&button) {
             return;
         }
+        self.hint_until = Instant::now();
         self.ink.end(Instant::now());
         self.renderer.pointer_down();
-        if self.settings_hit(p) {
-            self.draw();
-            return;
-        }
-        if let Some(i) = self.bar_hit(p) {
-            match i {
-                0 | 1 => {
-                    self.config.custom_enabled = false;
-                    self.config.style = (self.config.style + if i == 0 { 36 } else { 1 }) % 37;
-                    if let Err(e) = self.renderer.select_config(&self.config) {
-                        eprintln!("{e}");
-                    }
-                    self.save();
+
+        let px = (p.x - self.renderer.bar_x) / self.renderer.ui_scale;
+        let py = (p.y - self.renderer.bar_y) / self.renderer.ui_scale;
+        if self.page > 0 && (-62.0..-8.0).contains(&py) && (0.0..366.0).contains(&px) {
+            let i = ((px - 3.0) / 40.0).floor().max(0.0) as usize;
+            if i < 9 {
+                self.config.match_color = i == 0;
+                if i > 0 {
+                    self.config.color = tinyhand_rs::colors::SWATCH_ORDER[i - 1];
                 }
-                2 => {
-                    self.page = if self.page == 0 {
-                        1
-                    } else if self.page == 1 {
-                        2
-                    } else {
-                        0
-                    };
-                    self.settings.open = false;
-                }
-                3 => {
-                    self.config.sound = !self.config.sound;
-                    self.save();
-                }
-                4 => self.ink.clear(),
-                5 => {
-                    self.settings.open = !self.settings.open;
-                    self.page = 0;
-                }
-                6 => self.deactivate(),
-                _ => {}
-            }
-        } else if let Some(style) = self.grid_hit(p) {
-            self.config.style = style;
-            self.config.custom_enabled = false;
-            if let Err(e) = self.renderer.select(style) {
-                eprintln!("{e}");
+                self.save();
             }
             self.page = 0;
-            self.save();
+        } else if let Some(item) = self.bar_hit(p) {
+            use tinyhand_rs::toolbar::Item;
+            match item {
+                Item::Pointer(id) => {
+                    self.toolbar_drag = Some((id.clone(), p));
+                    self.desktop_event(Event::Pick(id));
+                }
+                Item::Ink => self.page = usize::from(self.page == 0),
+                Item::Sound => self.desktop_event(Event::Mute),
+                Item::Clear => self.desktop_event(Event::Clear),
+                Item::Settings => self.open_settings(),
+                Item::Exit => self.deactivate(),
+            }
         } else {
             self.page = 0;
-            if self.settings.open {
-                self.settings.open = false;
-            } else {
+            if button == 1 {
                 self.ink.down_with_brush(
                     p,
                     Brush {
                         color: self.renderer.ink_color(&self.config),
                         width: self.config.thickness,
+                        fade_after: self.config.fade,
                     },
                 );
-                self.pressed = Some(Instant::now());
-                if self.config.sound
-                    && (self.config.style != 36
-                        || self.config.custom_enabled
-                        || self.config.laser_sound)
-                {
-                    self.sound.tap(self.config.volume, self.config.sound_kind);
-                }
+            }
+            self.pressed = Some(Instant::now());
+            if self.config.tap_sound_enabled() {
+                self.sound.tap(self.config.volume, self.config.sound_kind);
             }
         }
         self.draw();
     }
 
-    unsafe fn handle(&mut self, e: XEvent) {
+    unsafe fn handle(&mut self, mut e: XEvent) {
+        if self.input.raw(self.display, &mut e) {
+            if self.active && self.passing {
+                self.query_pointer();
+                self.draw();
+            }
+            return;
+        }
         match e.type_ {
             2 => {
                 let k = e.key;
-                if let Some(toggle) = self.capture {
-                    let keysym = XKeycodeToKeysym(self.display, k.keycode as u8, 0);
-                    let text = XKeysymToString(keysym);
-                    if !text.is_null() {
-                        let s = CStr::from_ptr(text).to_string_lossy();
-                        if s.len() == 1
-                            && s.as_bytes()[0].is_ascii_alphabetic()
-                            && k.state & (4 | 8 | 1) != 0
-                        {
-                            let mut name = String::new();
-                            if k.state & 4 != 0 {
-                                name.push_str("Control+");
-                            }
-                            if k.state & 8 != 0 {
-                                name.push_str("Alt+");
-                            }
-                            if k.state & 1 != 0 {
-                                name.push_str("Shift+");
-                            }
-                            name.push_str(&s.to_ascii_lowercase());
-                            self.unregister_keys();
-                            if toggle {
-                                self.config.toggle = name;
-                            } else {
-                                self.config.clear = name;
-                            }
-                            self.toggle_key = shortcut(self.display, &self.config.toggle);
-                            self.clear_key = shortcut(self.display, &self.config.clear);
-                            self.register_keys();
-                            self.save();
-                        }
-                    }
-                    XUngrabKeyboard(self.display, 0);
-                    self.capture = None;
-                    self.draw();
-                    return;
-                }
                 if k.keycode == XKeysymToKeycode(self.display, 0xff1b) as u32 && self.active {
                     self.deactivate();
                     return;
                 }
-                let mods = k.state & !(2 | 16);
+                let mods = k.state & (1 | 4 | 8 | 64);
                 if (k.keycode as i32, mods) == self.toggle_key {
-                    if self.active {
-                        self.deactivate();
-                    } else if let Err(err) = self.activate() {
-                        eprintln!("{err}");
-                    }
+                    self.desktop_event(Event::Toggle);
                 } else if (k.keycode as i32, mods) == self.clear_key {
                     self.ink.clear();
                     self.draw();
                 }
             }
-            4 if e.button.window == self.tray => match e.button.button {
-                1 => {
-                    if self.active {
-                        self.deactivate();
-                    } else if let Err(err) = self.activate() {
-                        eprintln!("{err}");
-                    }
-                }
-                2 => self.quit = true,
-                3 => {
-                    if !self.active {
-                        if let Err(err) = self.activate() {
-                            eprintln!("{err}");
-                        }
-                    }
-                    self.settings.open = true;
-                    self.page = 0;
-                    self.draw();
-                }
-                _ => {}
-            },
             4 if self.active => {
                 let b = e.button;
+                let interaction = b.state & self.config.interaction_mask() != 0
+                    || self
+                        .input
+                        .held(self.display, self.config.interaction_mask());
+                if self.trace {
+                    eprintln!(
+                        "press {} at {},{} state={} interaction={} passing={}",
+                        b.button, b.x_root, b.y_root, b.state, interaction, self.passing
+                    );
+                }
+                if !self.passing
+                    && (interaction
+                        || tinyhand_rs::input::desktop_target(
+                            self.display,
+                            self.root,
+                            self.window,
+                            b.x_root,
+                            b.y_root,
+                        ))
+                {
+                    if self.trace {
+                        eprintln!("pass through target");
+                    }
+                    self.ink.end(Instant::now());
+                    self.renderer.pointer_up();
+                    self.passing = true;
+                    self.restore_at = None;
+                    self.renderer.pointer_visible = interaction && self.config.interact_keeps_hand;
+                    XUngrabPointer(self.display, 0);
+                    let escape = XKeysymToKeycode(self.display, 0xff1b) as i32;
+                    for extra in [0, 2, 16, 18] {
+                        XUngrabKey(self.display, escape, extra, self.root);
+                    }
+                    if self.renderer.pointer_visible {
+                        tinyhand_rs::input::XFixesHideCursor(self.display, self.root);
+                        self.cursor_hidden = true;
+                    }
+                    self.input.replay(
+                        self.display,
+                        b.button,
+                        if interaction {
+                            self.config.interaction_mask()
+                        } else {
+                            0
+                        },
+                    );
+                    self.draw();
+                    return;
+                }
                 self.press(
                     b.button,
                     Point {
@@ -988,8 +962,24 @@ impl App {
             }
             5 if self.active => {
                 let b = e.button;
+                if let Some((id, start)) = self.toolbar_drag.take() {
+                    let end = Point {
+                        x: b.x_root as f64,
+                        y: b.y_root as f64,
+                    };
+                    if start.distance(end) > 12.0 {
+                        if self.bar_hit(end).is_some() {
+                            let slot =
+                                ((end.x - self.renderer.bar_x) / self.renderer.ui_scale / 44.0)
+                                    .max(0.0) as usize;
+                            self.desktop_event(Event::Reorder(id, slot));
+                        } else {
+                            self.desktop_event(Event::Unpin(id));
+                        }
+                    }
+                }
                 self.ink.end(Instant::now());
-                if e.button.button == 1 || e.button.button == 3 {
+                if (1..=3).contains(&e.button.button) {
                     self.renderer.pointer_up();
                 }
                 self.cursor = Point {
@@ -1001,6 +991,12 @@ impl App {
             }
             6 if self.active => {
                 let m = e.motion;
+                if self.trace {
+                    eprintln!(
+                        "motion {},{} state={} passing={}",
+                        m.x_root, m.y_root, m.state, self.passing
+                    );
+                }
                 let p = Point {
                     x: m.x_root as f64,
                     y: m.y_root as f64,
@@ -1014,7 +1010,6 @@ impl App {
                 }
                 self.draw();
             }
-            12 if e.button.window == self.tray => self.paint_tray(),
             12 if self.active => {
                 self.renderer.invalidate();
                 self.draw();
@@ -1042,10 +1037,34 @@ impl App {
     }
 
     unsafe fn run(&mut self) -> Result<(), String> {
-        self.activate()?;
+        let present = std::env::args().any(|s| s == "--present" || s == "--toggle");
+        if present {
+            self.activate()?;
+        } else if !std::env::args().any(|s| s == "--background") || !self.config.welcomed {
+            self.open_settings();
+            if !self.config.welcomed {
+                self.config.welcomed = true;
+                self.save();
+                self.preferences.welcome();
+            }
+        }
         let fd = XConnectionNumber(self.display);
         while !self.quit && !STOP.load(Ordering::SeqCst) {
-            self.poll_import();
+            while let Some(command) = self.instance.receive() {
+                let event = match command.as_str() {
+                    "--background" => continue,
+                    "--present" => Event::Start,
+                    "--toggle" => Event::Toggle,
+                    "--stop" => Event::Stop,
+                    "--clear" => Event::Clear,
+                    "--quit" => Event::Quit,
+                    _ => Event::Settings,
+                };
+                self.desktop_event(event);
+            }
+            while let Ok(event) = self.rx.try_recv() {
+                self.desktop_event(event);
+            }
             let batch_start = Instant::now();
             let mut events = 0;
             while XPending(self.display) > 0
@@ -1057,7 +1076,96 @@ impl App {
                 self.handle(event);
                 events += 1;
             }
+            if XPending(self.display) == 0 {
+                self.input.clear_replayed();
+            }
             let now = Instant::now();
+            if self.active {
+                if !self.passing {
+                    let interaction = self
+                        .input
+                        .held(self.display, self.config.interaction_mask());
+                    if interaction != self.interaction_cursor {
+                        self.interaction_cursor = interaction;
+                        self.renderer.pointer_visible =
+                            !interaction || self.config.interact_keeps_hand;
+                        XChangeActivePointerGrab(
+                            self.display,
+                            (1 << 6) | (1 << 2) | (1 << 3),
+                            if interaction && !self.config.interact_keeps_hand {
+                                self.arrow
+                            } else {
+                                self.invisible
+                            },
+                            0,
+                        );
+                        self.draw();
+                    }
+                }
+                let x = (self.cursor.x - self.renderer.bar_x) / self.renderer.ui_scale;
+                let y = (self.cursor.y - self.renderer.bar_y) / self.renderer.ui_scale;
+                if (-70.0..self.renderer.toolbar_width + 70.0).contains(&x)
+                    && (-85.0..70.0).contains(&y)
+                    && self.input.buttons == 0
+                {
+                    self.revealed = now + Duration::from_millis(700);
+                }
+                let target = if !self.ink.is_drawing()
+                    && (now < self.revealed || self.page > 0 || self.toolbar_drag.is_some())
+                {
+                    1.0
+                } else {
+                    0.0
+                };
+                let old = self.renderer.toolbar_alpha;
+                let dt = now
+                    .saturating_duration_since(self.last_render)
+                    .as_secs_f64()
+                    .min(0.05);
+                let next = if target > old {
+                    (old + dt / 0.15).min(1.0)
+                } else {
+                    (old - dt / 0.35).max(0.0)
+                };
+                let hint = now < self.hint_until;
+                if next != old || self.renderer.hint != hint {
+                    self.renderer.toolbar_alpha = next;
+                    self.renderer.hint = hint;
+                    self.draw();
+                }
+            }
+            if self.restore_at.is_some_and(|deadline| now >= deadline)
+                && self.input.buttons == 0
+                && !self.passing
+            {
+                self.input.restore(self.display);
+                self.restore_at = None;
+            }
+            if self.active
+                && self.passing
+                && self.input.buttons == 0
+                && self.query_pointer() & (31 << 8) == 0
+            {
+                let mask = (1 << 6) | (1 << 2) | (1 << 3);
+                if XGrabPointer(self.display, self.root, 0, mask, 1, 1, 0, self.invisible, 0) == 0 {
+                    self.passing = false;
+                    // Raw releases precede delivery of the cooked mouse-up.
+                    // Restore modifiers after that event has reached its app.
+                    self.restore_at = Some(now + Duration::from_millis(25));
+                    self.interaction_cursor = false;
+                    self.renderer.pointer_visible = true;
+                    let escape = XKeysymToKeycode(self.display, 0xff1b) as i32;
+                    for extra in [0, 2, 16, 18] {
+                        XGrabKey(self.display, escape, extra, self.root, 0, 1, 1);
+                    }
+                    if self.cursor_hidden {
+                        tinyhand_rs::input::XFixesShowCursor(self.display, self.root);
+                        self.cursor_hidden = false;
+                    }
+                    self.query_pointer();
+                    self.draw();
+                }
+            }
             if now.duration_since(self.last_monitor_check) > Duration::from_secs(2) {
                 let before = (
                     self.renderer.bar_x,
@@ -1088,12 +1196,10 @@ impl App {
                 self.pressed = None;
                 self.draw();
             }
-            if !self.docked && now.duration_since(self.last_dock) > Duration::from_secs(2) {
-                self.dock_tray();
-            }
             let animating = self.active
-                && (self.renderer.motion_animating()
-                    || self.ink.strokes.iter().any(|s| s.released.is_some())
+                && ((self.renderer.toolbar_alpha > 0.0 && self.renderer.toolbar_alpha < 1.0)
+                    || self.renderer.motion_animating()
+                    || self.ink.needs_animation(now)
                     || self
                         .pressed
                         .is_some_and(|t| now.duration_since(t) < Duration::from_millis(300)));
@@ -1124,12 +1230,23 @@ impl App {
             } else {
                 500
             };
-            let mut pfd = PollFd {
-                fd,
-                events: 1,
-                revents: 0,
-            };
-            poll(&mut pfd, 1, wait.min(500) as i32);
+            let mut wait = self
+                .ink
+                .next_change(now)
+                .map_or(wait, |d| wait.min(d.as_millis().max(1) as u64));
+            if let Some(deadline) = self.restore_at {
+                if deadline > now {
+                    wait = wait.min((deadline - now).as_millis().max(1) as u64);
+                }
+            }
+            if self.active {
+                for deadline in [self.revealed, self.hint_until] {
+                    if deadline > now {
+                        wait = wait.min((deadline - now).as_millis().max(1) as u64);
+                    }
+                }
+            }
+            desktop::wait(fd, &[self.instance.fd()], wait.min(500) as i32);
         }
         Ok(())
     }
@@ -1139,15 +1256,14 @@ impl Drop for App {
     fn drop(&mut self) {
         unsafe {
             self.deactivate();
+            self.input.finish(self.display);
             self.unregister_keys();
             XSync(self.display, 0);
             std::thread::sleep(Duration::from_millis(100));
             self.renderer.release_x11();
             XDestroyWindow(self.display, self.window);
-            if self.tray != 0 {
-                XDestroyWindow(self.display, self.tray);
-            }
             XFreeCursor(self.display, self.invisible);
+            XFreeCursor(self.display, self.arrow);
             XFreeColormap(self.display, self.cmap);
             XCloseDisplay(self.display);
         }
@@ -1156,29 +1272,71 @@ impl Drop for App {
 
 fn main() {
     unsafe {
+        XInitThreads();
         signal(2, stop_signal);
         signal(15, stop_signal);
     }
-    let result = unsafe { App::new().and_then(|mut app| app.run()) };
-    if let Err(e) = result {
-        eprintln!("tinyhand-rs: {e}");
+    let args = std::env::args().skip(1).collect::<Vec<_>>();
+    if args.first().is_some_and(|s| s == "--make-hand") && args.len() == 3 {
+        match tinyhand_rs::hands::prepare(std::path::Path::new(&args[1]), "").and_then(|hand| {
+            std::fs::write(&args[2], &hand.png)
+                .map(|_| hand.ink)
+                .map_err(|e| e.to_string())
+        }) {
+            Ok(ink) => println!("ok {ink:06X}"),
+            Err(e) => {
+                eprintln!("rejected: {e}");
+                std::process::exit(1);
+            }
+        }
+        return;
+    }
+    if args.iter().any(|a| a == "--help") {
+        println!("TinyHand for Linux\nUsage: tinyhand-rs [--present|--settings|--toggle|--stop|--clear|--quit]\nNo option opens settings. Escape exits presentation mode.");
+        return;
+    }
+    if args.iter().any(|a| a == "--version") {
+        println!("tinyhand-rs {}", env!("CARGO_PKG_VERSION"));
+        return;
+    }
+    if args.iter().any(|a| {
+        ![
+            "--present",
+            "--background",
+            "--settings",
+            "--toggle",
+            "--stop",
+            "--clear",
+            "--quit",
+        ]
+        .contains(&a.as_str())
+    }) || args.len() > 1
+    {
+        eprintln!("Use --help for supported options.");
+        std::process::exit(2);
+    }
+    let command = args.first().map(String::as_str).unwrap_or("--settings");
+    let instance = match tinyhand_rs::instance::Instance::open(command) {
+        Ok(Some(instance)) => instance,
+        Ok(None) => return,
+        Err(e) => {
+            eprintln!("Cannot start TinyHand: {e}");
+            std::process::exit(1);
+        }
+    };
+    if command == "--quit" || command == "--stop" || command == "--clear" {
+        return;
+    }
+    if let Err(e) = gtk::init() {
+        eprintln!("Cannot initialize GTK: {e}");
         std::process::exit(1);
     }
-}
-
-#[cfg(test)]
-mod safety_tests {
-    use super::{is_cinnamon_desktop, is_muffin_name};
-
-    #[test]
-    fn cinnamon_and_muffin_names_disable_the_legacy_tray() {
-        assert!(is_cinnamon_desktop("X-Cinnamon", ""));
-        assert!(is_cinnamon_desktop("GNOME:Cinnamon", ""));
-        assert!(is_cinnamon_desktop("", "cinnamon"));
-        assert!(!is_cinnamon_desktop("XFCE", "xfce"));
-        assert!(is_muffin_name("Mutter (Muffin)"));
-        assert!(is_muffin_name("Cinnamon"));
-        assert!(!is_muffin_name("Mutter"));
-        assert!(!is_muffin_name("Xfwm4"));
+    tinyhand_rs::logging::write("startup", concat!("version=", env!("CARGO_PKG_VERSION")));
+    let result = unsafe { App::new(instance).and_then(|mut app| app.run()) };
+    tinyhand_rs::logging::write("shutdown", if result.is_ok() { "clean" } else { "error" });
+    if let Err(e) = result {
+        tinyhand_rs::logging::write("fatal", &e);
+        eprintln!("tinyhand-rs: {e}");
+        std::process::exit(1);
     }
 }

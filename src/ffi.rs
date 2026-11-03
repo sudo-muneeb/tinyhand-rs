@@ -32,6 +32,33 @@ pub struct XSetWindowAttributes {
 }
 
 #[repr(C)]
+#[derive(Default)]
+pub struct XWindowAttributes {
+    pub x: c_int,
+    pub y: c_int,
+    pub width: c_int,
+    pub height: c_int,
+    pub border_width: c_int,
+    pub depth: c_int,
+    pub visual: *mut Visual,
+    pub root: Window,
+    pub class: c_int,
+    pub bit_gravity: c_int,
+    pub win_gravity: c_int,
+    pub backing_store: c_int,
+    pub backing_planes: c_ulong,
+    pub backing_pixel: c_ulong,
+    pub save_under: c_int,
+    pub colormap: Colormap,
+    pub map_installed: c_int,
+    pub map_state: c_int,
+    pub all_event_masks: c_long,
+    pub your_event_mask: c_long,
+    pub do_not_propagate_mask: c_long,
+    pub override_redirect: c_int,
+    pub screen: *mut c_void,
+}
+#[repr(C)]
 #[derive(Clone, Copy, Default)]
 pub struct XColor {
     pub pixel: c_ulong,
@@ -171,6 +198,15 @@ pub struct PollFd {
 
 #[link(name = "X11")]
 extern "C" {
+    pub fn XGetWindowAttributes(d: *mut Display, w: Window, a: *mut XWindowAttributes) -> c_int;
+    pub fn XChangeActivePointerGrab(
+        d: *mut Display,
+        mask: u32,
+        cursor: Cursor,
+        time: c_ulong,
+    ) -> c_int;
+    pub fn XCreateFontCursor(d: *mut Display, shape: u32) -> Cursor;
+    pub fn XInitThreads() -> i32;
     pub fn XOpenDisplay(name: *const c_char) -> *mut Display;
     pub fn XSetErrorHandler(
         handler: Option<extern "C" fn(*mut Display, *mut XErrorEvent) -> c_int>,
@@ -432,6 +468,8 @@ extern "C" {
         height: c_int,
     ) -> *mut Surface;
     pub fn cairo_xlib_surface_set_size(s: *mut Surface, width: c_int, height: c_int);
+    pub fn cairo_push_group(c: *mut Cairo);
+    pub fn cairo_pop_group_to_source(c: *mut Cairo);
     pub fn cairo_image_surface_create_from_png(path: *const c_char) -> *mut Surface;
     pub fn cairo_image_surface_create(format: c_int, width: c_int, height: c_int) -> *mut Surface;
     pub fn cairo_image_surface_get_data(s: *mut Surface) -> *mut u8;
@@ -455,6 +493,15 @@ extern "C" {
     pub fn cairo_clip(c: *mut Cairo);
     pub fn cairo_close_path(c: *mut Cairo);
     pub fn cairo_line_to(c: *mut Cairo, x: c_double, y: c_double);
+    pub fn cairo_curve_to(
+        c: *mut Cairo,
+        x1: c_double,
+        y1: c_double,
+        x2: c_double,
+        y2: c_double,
+        x3: c_double,
+        y3: c_double,
+    );
     pub fn cairo_stroke(c: *mut Cairo);
     pub fn cairo_fill(c: *mut Cairo);
     pub fn cairo_arc(

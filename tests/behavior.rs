@@ -33,7 +33,9 @@ fn release_clear_and_fade_cleanup() {
     ink.end(t);
     ink.prune(t + Duration::from_millis(2900), Duration::from_secs(3));
     assert_eq!(ink.strokes.len(), 1);
-    ink.prune(t + Duration::from_millis(3000), Duration::from_secs(3));
+    assert_eq!(ink.strokes[0].opacity(t + Duration::from_secs(3)), 1.0);
+    assert!((ink.strokes[0].opacity(t + Duration::from_millis(3300)) - 0.75).abs() < 0.001);
+    ink.prune(t + Duration::from_millis(3600), Duration::from_secs(3));
     assert!(ink.strokes.is_empty());
     ink.down(Point { x: 10.0, y: 10.0 });
     ink.clear();
@@ -78,4 +80,41 @@ fn every_pointer_asset_and_shortcuts() {
     assert!(valid_shortcut(&Config::default().toggle));
     assert!(valid_shortcut("Control+Shift+z"));
     assert!(!valid_shortcut("z"));
+}
+
+#[test]
+fn fade_delay_and_keep_ink_do_not_request_busy_idle_timers() {
+    use tinyhand_rs::ink::Brush;
+    let now = Instant::now();
+    let mut ink = Ink::new();
+    ink.down_with_brush(
+        Point { x: 0.0, y: 0.0 },
+        Brush {
+            fade_after: 6.0,
+            ..Brush::default()
+        },
+    );
+    ink.move_to(Point { x: 100.0, y: 100.0 });
+    ink.end(now);
+    assert!(!ink.needs_animation(now + Duration::from_secs(5)));
+    assert_eq!(ink.next_change(now), Some(Duration::from_secs(6)));
+    assert!(ink.needs_animation(now + Duration::from_millis(6200)));
+    assert!(
+        ink.next_change(now + Duration::from_millis(6200)).is_none(),
+        "the frame timer handles the fade, without a 1ms wake loop"
+    );
+    ink.down_with_brush(
+        Point { x: 0.0, y: 10.0 },
+        Brush {
+            fade_after: 0.0,
+            ..Brush::default()
+        },
+    );
+    ink.move_to(Point { x: 100.0, y: 110.0 });
+    ink.end(now);
+    ink.prune(now + Duration::from_secs(1000), Duration::ZERO);
+    assert_eq!(ink.strokes.len(), 1);
+    assert_eq!(ink.strokes[0].opacity(now + Duration::from_secs(1000)), 1.0);
+    assert!(!ink.needs_animation(now + Duration::from_secs(1000)));
+    assert!(ink.next_change(now + Duration::from_secs(1000)).is_none());
 }

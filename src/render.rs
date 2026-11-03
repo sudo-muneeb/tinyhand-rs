@@ -2,13 +2,14 @@ use crate::colors::{self, Rgb, SWATCHES};
 use crate::config::{Config, STYLES};
 use crate::ffi::*;
 use crate::ink::{Ink, Point};
-use crate::settings::{self, SettingsUi};
 mod hand;
-mod settings_panel;
+mod thumbnails;
 use crate::motion::{HandGeometry, HandMotion, HandPose};
 use std::ffi::CString;
 use std::path::{Path, PathBuf};
-use std::time::{Duration, Instant};
+#[cfg(test)]
+use std::time::Duration;
+use std::time::Instant;
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 struct Rect {
@@ -59,18 +60,25 @@ struct Frame {
     ink: Option<Rect>,
     ui: Rect,
     config: Config,
-    settings: SettingsUi,
     page: usize,
+    toolbar_alpha: f64,
+    pointer_visible: bool,
+    hint: bool,
 }
 
 pub struct Renderer {
     pub surface: *mut Surface,
+    pub pointer_visible: bool,
+    pub toolbar_alpha: f64,
+    pub toolbar_width: f64,
+    pub hint: bool,
     display: *mut Display,
     window: Window,
     pixmap: Pixmap,
     gc: *mut std::ffi::c_void,
     visual: *mut Visual,
     hand: *mut Surface,
+    detail: i32,
     tip: Point,
     pub width: i32,
     pub height: i32,
@@ -82,10 +90,8 @@ pub struct Renderer {
     asset_dir: PathBuf,
     loaded: usize,
     last_frame: Option<Frame>,
-    pub settings_x: f64,
-    pub settings_y: f64,
-    pub settings_scale: f64,
     previews: Vec<*mut Surface>,
+    custom_previews: std::collections::HashMap<String, *mut Surface>,
     custom_loaded: String,
     custom_ink: Rgb,
     geometry: HandGeometry,
@@ -104,7 +110,7 @@ impl Renderer {
         width: i32,
         height: i32,
         asset_dir: PathBuf,
-        style: usize,
+        config: &Config,
     ) -> Result<Self, String> {
         let pixmap = XCreatePixmap(display, window, width as u32, height as u32, 32);
         let gc = XCreateGC(display, window, 0, std::ptr::null_mut());
@@ -118,12 +124,17 @@ impl Renderer {
         }
         let mut this = Self {
             surface,
+            pointer_visible: true,
+            toolbar_alpha: 1.0,
+            toolbar_width: 488.0,
+            hint: false,
             display,
             window,
             pixmap,
             gc,
             visual,
             hand: std::ptr::null_mut(),
+            detail: 384,
             tip: Point { x: 0.0, y: 0.0 },
             width,
             height,
@@ -144,17 +155,15 @@ impl Renderer {
             asset_dir,
             loaded: 36,
             last_frame: None,
-            settings_x: 60.0,
-            settings_y: 56.0,
-            settings_scale: 1.0,
             previews: Vec::new(),
+            custom_previews: std::collections::HashMap::new(),
             custom_loaded: String::new(),
             custom_ink: colors::PURPLE,
             geometry: HandGeometry::default(),
             motion: HandMotion::default(),
             monitor: (0, 0, width, height),
         };
-        this.select(style)?;
+        this.select_config(config)?;
         Ok(this)
     }
 
@@ -175,16 +184,42 @@ impl Renderer {
             if cairo_surface_status(self.hand) != 0 {
                 return Err(format!("Could not load {}", path.display()));
             }
-            self.geometry = hand::measure_hand(self.hand);
-            self.tip = self.geometry.tip;
+            self.prepare_detail();
         }
         self.loaded = style;
         Ok(())
     }
 
+    /// Keep one image at a resolution appropriate to the displayed hand.
+    /// The original PNG remains on disk for large pointers and high-DPI screens.
+    unsafe fn prepare_detail(&mut self) {
+        let w = cairo_image_surface_get_width(self.hand);
+        let h = cairo_image_surface_get_height(self.hand);
+        if w > self.detail {
+            let height = (h as f64 * self.detail as f64 / w as f64).round() as i32;
+            let small = cairo_image_surface_create(0, self.detail, height);
+            let c = cairo_create(small);
+            cairo_scale(c, self.detail as f64 / w as f64, height as f64 / h as f64);
+            cairo_set_source_surface(c, self.hand, 0.0, 0.0);
+            cairo_paint(c);
+            cairo_destroy(c);
+            cairo_surface_destroy(self.hand);
+            self.hand = small;
+        }
+        self.geometry = hand::measure_hand(self.hand);
+        self.tip = self.geometry.tip;
+    }
+
     /// # Safety
     /// Must run on the renderer's X11 thread with its display still live.
     pub unsafe fn select_config(&mut self, config: &Config) -> Result<(), String> {
+        let detail =
+            ((config.size * self.monitor_h * 2.5 / 128.0).ceil() as i32 * 128).clamp(256, 1024);
+        if detail != self.detail {
+            self.detail = detail;
+            self.loaded = usize::MAX;
+            self.custom_loaded.clear();
+        }
         if !config.custom_enabled {
             self.custom_loaded.clear();
             return self.select(config.style);
@@ -222,6 +257,7 @@ impl Renderer {
         self.tip = self.geometry.tip;
         self.loaded = 37;
         self.custom_ink = hand::custom_ink(self.hand, self.geometry.wrist as usize);
+        self.prepare_detail();
         self.custom_loaded = config.custom_path.clone();
         self.invalidate();
         Ok(())
@@ -242,6 +278,10 @@ impl Renderer {
             cairo_xlib_surface_set_size(self.surface, width, height);
         }
         self.invalidate();
+    }
+
+    pub fn set_custom_ink(&mut self, ink: u32) {
+        self.custom_ink = colors::hex(ink);
     }
 
     pub fn ink_color(&self, config: &Config) -> Rgb {
@@ -267,6 +307,24 @@ impl Renderer {
     }
     pub fn motion_animating(&self) -> bool {
         self.motion.is_animating()
+    }
+
+    /// # Safety
+    /// Must run on the renderer thread while its display is live.
+    pub unsafe fn warm_toolbar(&mut self, config: &Config) {
+        let surface = cairo_image_surface_create(0, 1, 1);
+        let c = cairo_create(surface);
+        for item in crate::toolbar::items(config) {
+            if let crate::toolbar::Item::Pointer(id) = item {
+                if let Some(index) = STYLES.iter().position(|s| *s == id) {
+                    self.thumbnail(c, index, 0.0, 0.0, 1.0);
+                } else {
+                    self.custom_thumbnail(c, &id, 0.0, 0.0, 1.0);
+                }
+            }
+        }
+        cairo_destroy(c);
+        cairo_surface_destroy(surface);
     }
 
     pub fn invalidate(&mut self) {
@@ -295,23 +353,12 @@ impl Renderer {
             .unwrap_or(monitor);
         self.ui_scale = self
             .requested_scale
-            .min((bw as f64 - 16.0) / 488.0)
-            .clamp(0.5, 3.0);
-        self.bar_x = (bx as f64 + (bw as f64 - 488.0 * self.ui_scale) / 2.0).max(bx as f64);
+            .min((bw as f64 - 16.0) / self.toolbar_width)
+            .clamp(0.25, 3.0);
+        self.bar_x =
+            (bx as f64 + (bw as f64 - self.toolbar_width * self.ui_scale) / 2.0).max(bx as f64);
         self.bar_y = (by + bh) as f64 - (8.0 + 54.0) * self.ui_scale;
         self.monitor_h = h as f64;
-        self.settings_scale = self
-            .requested_scale
-            .min((w as f64 - 32.0) / settings::WIDTH)
-            .min((h as f64 - 110.0) / settings::HEIGHT)
-            .min((self.bar_y - y as f64 - 24.0) / settings::HEIGHT)
-            .clamp(0.4, 3.0);
-        self.settings_x = x as f64 + (w as f64 - settings::WIDTH * self.settings_scale) / 2.0;
-        self.settings_y = y as f64 + (h as f64 - settings::HEIGHT * self.settings_scale) / 2.0;
-        self.settings_y = self
-            .settings_y
-            .min(self.bar_y - 16.0 - settings::HEIGHT * self.settings_scale)
-            .max(y as f64 + 8.0);
     }
 
     /// # Safety
@@ -321,10 +368,11 @@ impl Renderer {
         config: &Config,
         ink: &Ink,
         cursor: Point,
-        ui: (SettingsUi, usize),
+        page: usize,
         pressed: Option<Instant>,
         now: Instant,
     ) {
+        self.toolbar_width = crate::toolbar::width(config);
         let laser = config.style == 36 && !config.custom_enabled;
         let (grip, press) = self.motion.advance(cursor, self.monitor, now, !laser);
         let pose = HandPose::new(
@@ -338,7 +386,7 @@ impl Renderer {
         );
         let pointer = self.hand_bounds(config, cursor, pose);
         let ink_bounds = ink_bounds(ink);
-        let ui_bounds = self.ui_bounds(ui);
+        let ui_bounds = self.ui_bounds(page);
         let mut damage = Rect {
             x: 0.0,
             y: 0.0,
@@ -361,12 +409,13 @@ impl Renderer {
                 damage = damage.union(rect);
                 rect.clip_path(c);
             }
-            // Repaint the modal panel as a coherent region.
-            if ui.0.open
-                || previous.ui != ui_bounds
+            // Repaint both toolbar bounds when its geometry, palette or opacity changes.
+            if previous.ui != ui_bounds
                 || previous.config != *config
-                || previous.settings != ui.0
-                || previous.page != ui.1
+                || previous.page != page
+                || previous.toolbar_alpha != self.toolbar_alpha
+                || previous.pointer_visible != self.pointer_visible
+                || previous.hint != self.hint
             {
                 for rect in [previous.ui, ui_bounds] {
                     damage = damage.union(rect);
@@ -381,78 +430,71 @@ impl Renderer {
         cairo_set_line_cap(c, 1);
         cairo_set_line_join(c, 1);
         let (r, g, b) = self.ink_color(config);
-        let fade = Duration::from_secs_f64(config.fade);
         for stroke in &ink.strokes {
             if stroke.points.len() < 2 {
                 continue;
             }
-            let alpha = stroke.released.map_or(1.0, |t| {
-                1.0 - now.saturating_duration_since(t).as_secs_f64() / fade.as_secs_f64()
-            });
+            let alpha = stroke.opacity(now);
+            cairo_save(c);
+            cairo_translate(c, 1.0, 1.5);
+            stroke_path(c, stroke);
+            cairo_set_source_rgba(c, 0.0, 0.0, 0.0, alpha * 0.16);
+            cairo_set_line_width(c, stroke.brush.width + 1.5);
+            cairo_stroke(c);
+            cairo_restore(c);
+            stroke_path(c, stroke);
             let (sr, sg, sb) = stroke.brush.color;
-            cairo_set_source_rgba(c, sr, sg, sb, alpha.max(0.0));
+            cairo_set_source_rgba(c, sr, sg, sb, alpha);
             cairo_set_line_width(c, stroke.brush.width);
-            cairo_move_to(c, stroke.points[0].x, stroke.points[0].y);
-            for p in &stroke.points[1..] {
-                cairo_line_to(c, p.x, p.y);
-            }
             cairo_stroke(c);
         }
         cairo_save(c);
         cairo_translate(c, self.bar_x, self.bar_y);
         cairo_scale(c, self.ui_scale, self.ui_scale);
-        self.toolbar(c, config, ui.0.open, ui.1);
-        cairo_restore(c);
-        if ui.0.open {
-            self.settings_panel(c, config, ui.0);
+        if self.toolbar_alpha > 0.0 {
+            if self.toolbar_alpha >= 1.0 {
+                self.toolbar(c, config, page);
+            } else {
+                cairo_push_group(c);
+                self.toolbar(c, config, page);
+                cairo_pop_group_to_source(c);
+                cairo_paint_with_alpha(c, self.toolbar_alpha);
+            }
         }
+        cairo_restore(c);
         // The pointer and tap pulse are always the final layers, including
         // when their damage region intersects a toolbar or settings button.
-        let pulse = pressed.map_or(0.0, |t| {
-            (1.0 - now.saturating_duration_since(t).as_secs_f64() / 0.28).max(0.0)
-        });
-        if pulse > 0.0 {
+        let _ = (pressed, r, g, b);
+        if self.pointer_visible && config.style == 36 && !config.custom_enabled {
+            let radius =
+                (self.monitor_h * 0.0038 * config.size / 0.13).max(4.0) * (1.0 + 0.2 * press);
+            cairo_set_source_rgba(c, colors::RED.0, colors::RED.1, colors::RED.2, 0.22);
             cairo_new_path(c);
-            cairo_set_source_rgba(c, r, g, b, pulse * 0.55);
-            cairo_set_line_width(c, 2.5);
             cairo_arc(
                 c,
                 cursor.x,
                 cursor.y,
-                9.0 + 20.0 * (1.0 - pulse),
+                radius * 2.8,
                 0.0,
                 std::f64::consts::TAU,
             );
-            cairo_stroke(c);
-        }
-        if config.style == 36 && !config.custom_enabled {
-            cairo_set_source_rgba(c, colors::RED.0, colors::RED.1, colors::RED.2, 0.22);
-            cairo_new_path(c);
-            cairo_arc(c, cursor.x, cursor.y, 20.0, 0.0, std::f64::consts::TAU);
             cairo_fill(c);
             cairo_set_source_rgba(c, colors::RED.0, colors::RED.1, colors::RED.2, 1.0);
             cairo_new_path(c);
-            cairo_arc(
-                c,
-                cursor.x,
-                cursor.y,
-                7.5 * (1.0 + 0.2 * press),
-                0.0,
-                std::f64::consts::TAU,
-            );
+            cairo_arc(c, cursor.x, cursor.y, radius, 0.0, std::f64::consts::TAU);
             cairo_fill(c);
             cairo_set_source_rgba(c, 1.0, 0.86, 0.82, 0.95);
             cairo_new_path(c);
             cairo_arc(
                 c,
-                cursor.x - 1.5,
-                cursor.y - 1.5,
-                2.2,
+                cursor.x,
+                cursor.y,
+                radius * 0.45,
                 0.0,
                 std::f64::consts::TAU,
             );
             cairo_fill(c);
-        } else if !self.hand.is_null() {
+        } else if self.pointer_visible && !self.hand.is_null() {
             self.paint_hand(c, config, cursor, pose);
         }
         cairo_destroy(c);
@@ -488,8 +530,10 @@ impl Renderer {
             ink: ink_bounds,
             ui: ui_bounds,
             config: config.clone(),
-            settings: ui.0,
-            page: ui.1,
+            page,
+            toolbar_alpha: self.toolbar_alpha,
+            pointer_visible: self.pointer_visible,
+            hint: self.hint,
         });
     }
 
@@ -501,6 +545,9 @@ impl Renderer {
             cairo_surface_flush(self.surface);
             cairo_surface_destroy(self.surface);
             self.surface = std::ptr::null_mut();
+        }
+        for (_, preview) in self.custom_previews.drain() {
+            cairo_surface_destroy(preview);
         }
         for preview in self.previews.drain(..) {
             if !preview.is_null() {
@@ -518,84 +565,139 @@ impl Renderer {
         }
     }
 
-    fn ui_bounds(&self, ui: (SettingsUi, usize)) -> Rect {
-        let top = if !ui.0.open && ui.1 > 0 { -336.0 } else { 0.0 };
-        let toolbar = Rect {
+    fn ui_bounds(&self, page: usize) -> Rect {
+        let top = if page > 0 || self.hint { -68.0 } else { 0.0 };
+        Rect {
             x: self.bar_x - 2.0,
             y: self.bar_y + top * self.ui_scale - 2.0,
-            w: 492.0 * self.ui_scale,
+            w: (self.toolbar_width + 4.0).max(370.0) * self.ui_scale,
             h: (54.0 - top) * self.ui_scale + 4.0,
-        };
-        if ui.0.open {
-            toolbar.union(Rect {
-                x: self.settings_x - 16.0,
-                y: self.settings_y - 16.0,
-                w: settings::WIDTH * self.settings_scale + 32.0,
-                h: settings::HEIGHT * self.settings_scale + 32.0,
-            })
-        } else {
-            toolbar
         }
     }
 
-    unsafe fn toolbar(&self, c: *mut Cairo, config: &Config, settings: bool, page: usize) {
-        let x = 0.0;
-        let y = 0.0;
-        rounded(c, x, y, 488.0, 54.0, 16.0);
-        cairo_set_source_rgba(c, 0.10, 0.11, 0.15, 0.92);
+    unsafe fn toolbar(&mut self, c: *mut Cairo, config: &Config, page: usize) {
+        use crate::toolbar::{self, Item};
+        rounded(c, 0.0, 0.0, self.toolbar_width, 54.0, 16.0);
+        cairo_set_source_rgba(c, 0.10, 0.11, 0.15, 0.94);
         cairo_fill(c);
-        let labels = [
-            "<",
-            ">",
-            "Hands",
-            if config.sound { "Sound on" } else { "Muted" },
-            "Clear",
-            "Settings",
-            "Exit",
-        ];
-        let widths = [42.0, 42.0, 86.0, 95.0, 66.0, 96.0, 61.0];
-        let mut bx = x;
-        for (i, (&label, width)) in labels.iter().zip(widths).enumerate() {
-            if i == 2 {
-                cairo_set_source_rgba(c, 0.58, 0.4, 0.89, 0.42);
-                rounded(c, bx + 2.0, y + 6.0, width - 4.0, 42.0, 10.0);
-                cairo_fill(c);
-            }
-            set_text(c, bx + 10.0, y + 33.0, 12.0, label);
-            bx += width;
-        }
-        if page > 0 && !settings {
-            let rows = 6;
-            let h = 6.0 * 48.0 + 38.0;
-            let py = y - h - 10.0;
-            rounded(c, x, py, 488.0, h, 16.0);
-            cairo_set_source_rgba(c, 0.1, 0.11, 0.15, 0.96);
-            cairo_fill(c);
-            set_text(c, x + 16.0, py + 26.0, 15.0, "Choose a pointer");
-            for i in 0..rows {
-                for j in 0..6 {
-                    let index = (page - 1) * 36 + i * 6 + j;
-                    if index >= STYLES.len() {
-                        break;
+        for (index, item) in toolbar::items(config).iter().enumerate() {
+            let x = 6.0 + index as f64 * 44.0;
+            if let Item::Pointer(id) = item {
+                if *id == config.selected_id() {
+                    rounded(c, x, 6.0, 42.0, 42.0, 10.0);
+                    cairo_set_source_rgba(c, 0.58, 0.4, 0.89, 0.45);
+                    cairo_fill(c);
+                }
+                if let Some(style) = STYLES.iter().position(|s| *s == id) {
+                    self.thumbnail(c, style, x + 4.0, 9.0, 34.0);
+                } else {
+                    self.custom_thumbnail(c, id, x + 4.0, 9.0, 34.0);
+                }
+            } else {
+                let text = match item {
+                    Item::Ink => "●",
+                    Item::Sound => {
+                        if config.tap_sound_enabled() {
+                            "♫"
+                        } else {
+                            "×♫"
+                        }
                     }
-                    let cx = x + 17.0 + j as f64 * 78.0;
-                    let cy = py + 42.0 + i as f64 * 48.0;
-                    if index == config.style {
-                        rounded(c, cx - 4.0, cy, 77.0, 42.0, 9.0);
-                        cairo_set_source_rgba(c, 0.55, 0.38, 0.8, 0.65);
-                        cairo_fill(c);
-                    }
-                    let label = STYLES[index];
-                    set_text(
-                        c,
-                        cx,
-                        cy + 24.0,
-                        if label.len() > 8 { 10.0 } else { 12.0 },
-                        label,
-                    );
+                    Item::Clear => "⌫",
+                    Item::Settings => "⚙",
+                    Item::Exit => "×",
+                    _ => "",
+                };
+                if matches!(item, Item::Ink) {
+                    let (r, g, b) = self.ink_color(config);
+                    cairo_set_source_rgba(c, r, g, b, 1.0);
+                    cairo_new_path(c);
+                    cairo_arc(c, x + 22.0, 27.0, 9.0, 0.0, std::f64::consts::TAU);
+                    cairo_fill(c);
+                } else {
+                    set_text(c, x + 12.0, 34.0, 20.0, text);
                 }
             }
         }
+        if page > 0 {
+            rounded(c, 0.0, -62.0, 366.0, 54.0, 14.0);
+            cairo_set_source_rgba(c, 0.10, 0.11, 0.15, 0.98);
+            cairo_fill(c);
+            for i in 0..9 {
+                let x = 23.0 + i as f64 * 40.0;
+                let selected = if i == 0 {
+                    config.match_color
+                } else {
+                    !config.match_color && config.color == colors::SWATCH_ORDER[i - 1]
+                };
+                if selected {
+                    cairo_set_source_rgba(c, 1.0, 1.0, 1.0, 0.75);
+                    cairo_set_line_width(c, 2.0);
+                    cairo_new_path(c);
+                    cairo_arc(c, x, -35.0, 14.0, 0.0, std::f64::consts::TAU);
+                    cairo_stroke(c);
+                }
+                let (r, g, b) = if i == 0 {
+                    self.ink_color(&Config {
+                        match_color: true,
+                        ..config.clone()
+                    })
+                } else {
+                    SWATCHES[colors::SWATCH_ORDER[i - 1]]
+                };
+                cairo_set_source_rgba(c, r, g, b, 1.0);
+                cairo_new_path(c);
+                cairo_arc(c, x, -35.0, 10.0, 0.0, std::f64::consts::TAU);
+                cairo_fill(c);
+                if i == 0 {
+                    set_text(c, x - 5.0, -31.0, 12.0, "↔");
+                }
+            }
+        } else if self.hint {
+            rounded(c, 0.0, -50.0, self.toolbar_width.max(350.0), 38.0, 12.0);
+            cairo_set_source_rgba(c, 0.10, 0.11, 0.15, 0.92);
+            cairo_fill(c);
+            set_text(
+                c,
+                12.0,
+                -26.0,
+                12.0,
+                &format!(
+                    "Drag to draw · Hold {} to interact · Esc to exit",
+                    config.interact_key
+                ),
+            );
+        }
+    }
+}
+
+unsafe fn stroke_path(c: *mut Cairo, stroke: &crate::ink::Stroke) {
+    cairo_new_path(c);
+    let Some(first) = stroke.points.first() else {
+        return;
+    };
+    cairo_move_to(c, first.x, first.y);
+    let mut at = *first;
+    for pair in stroke.points.windows(2) {
+        let p = pair[0];
+        let next = pair[1];
+        let mid = Point {
+            x: (p.x + next.x) / 2.0,
+            y: (p.y + next.y) / 2.0,
+        };
+        cairo_curve_to(
+            c,
+            at.x + (p.x - at.x) * 2.0 / 3.0,
+            at.y + (p.y - at.y) * 2.0 / 3.0,
+            mid.x + (p.x - mid.x) * 2.0 / 3.0,
+            mid.y + (p.y - mid.y) * 2.0 / 3.0,
+            mid.x,
+            mid.y,
+        );
+        at = mid;
+    }
+    if let Some(last) = stroke.points.last() {
+        cairo_line_to(c, last.x, last.y);
     }
 }
 
@@ -606,7 +708,7 @@ fn ink_bounds(ink: &Ink) -> Option<Rect> {
             stroke
                 .points
                 .iter()
-                .map(move |point| Rect::around(*point, stroke.brush.width * 0.5 + 3.0))
+                .map(move |point| Rect::around(*point, stroke.brush.width * 0.5 + 8.0))
         })
         .reduce(|bounds, next| bounds.union(next))
 }
@@ -680,12 +782,17 @@ mod tests {
             let surface = cairo_image_surface_create(0, 800, 600);
             let mut r = Renderer {
                 surface,
+                pointer_visible: true,
+                toolbar_alpha: 1.0,
+                toolbar_width: 488.0,
+                hint: false,
                 display: std::ptr::null_mut(),
                 window: 0,
                 pixmap: 0,
                 gc: std::ptr::null_mut(),
                 visual: std::ptr::null_mut(),
                 hand: std::ptr::null_mut(),
+                detail: 384,
                 tip: Point { x: 0.0, y: 0.0 },
                 width: 800,
                 height: 600,
@@ -697,10 +804,8 @@ mod tests {
                 asset_dir: asset_dir().unwrap(),
                 loaded: 36,
                 last_frame: None,
-                settings_x: 60.0,
-                settings_y: 56.0,
-                settings_scale: 1.0,
                 previews: Vec::new(),
+                custom_previews: std::collections::HashMap::new(),
                 custom_loaded: String::new(),
                 custom_ink: colors::PURPLE,
                 geometry: HandGeometry::default(),
@@ -728,7 +833,7 @@ mod tests {
                 &Config::default(),
                 &ink,
                 Point { x: 400.0, y: 300.0 },
-                (SettingsUi::default(), 0),
+                0,
                 None,
                 now,
             );
@@ -747,7 +852,7 @@ mod tests {
                 &Config::default(),
                 &ink,
                 Point { x: 650.0, y: 300.0 },
-                (SettingsUi::default(), 0),
+                0,
                 None,
                 now,
             );
@@ -772,111 +877,16 @@ mod tests {
                 ..Config::default()
             };
             r.select(36).unwrap();
-            r.paint(
-                &config,
-                &ink,
-                Point { x: 400.0, y: 550.0 },
-                (SettingsUi::default(), 0),
-                None,
-                now,
-            );
+            r.paint(&config, &ink, Point { x: 400.0, y: 550.0 }, 0, None, now);
             cairo_surface_flush(surface);
             let red = |x: usize, y: usize| *data.add(y * stride + x * 4 + 2);
             assert!(red(400, 550) > 200, "pointer must be above toolbar buttons");
-            for tab in 0..6 {
-                let ui = SettingsUi {
-                    open: true,
-                    tab,
-                    ..SettingsUi::default()
-                };
-                r.paint(
-                    &config,
-                    &ink,
-                    Point { x: 760.0, y: 30.0 },
-                    (ui, 0),
-                    None,
-                    now,
-                );
-                let path = CString::new(format!("/tmp/tinyhand-settings-{tab}.png")).unwrap();
-                assert_eq!(cairo_surface_write_to_png(surface, path.as_ptr()), 0);
-            }
-            let ui = SettingsUi {
-                open: true,
-                tab: 1,
-                custom: true,
-                ..SettingsUi::default()
-            };
-            r.paint(
-                &config,
-                &ink,
-                Point { x: 760.0, y: 30.0 },
-                (ui, 0),
-                None,
-                now,
-            );
-            let path = CString::new("/tmp/tinyhand-settings-custom.png").unwrap();
-            assert_eq!(cairo_surface_write_to_png(surface, path.as_ptr()), 0);
-            r.paint(
-                &config,
-                &ink,
-                Point { x: 600.0, y: 190.0 },
-                (ui, 0),
-                None,
-                now,
-            );
-            cairo_surface_flush(surface);
-            assert!(
-                red(600, 190) > 200,
-                "pointer must be above settings controls"
-            );
-            // Fading ink underneath an opaque settings window must not
-            // alter its pixels or leave rectangular damage-edge seams.
-            let ui = SettingsUi {
-                open: true,
-                ..SettingsUi::default()
-            };
-            r.paint(
-                &config,
-                &ink,
-                Point { x: 760.0, y: 30.0 },
-                (ui, 0),
-                None,
-                now,
-            );
-            cairo_surface_flush(surface);
-            let sample = || {
-                (80..200)
-                    .flat_map(|y| {
-                        (80..220).flat_map(move |x| {
-                            let pixel = data.add(y * stride + x * 4);
-                            std::slice::from_raw_parts(pixel, 4).to_vec()
-                        })
-                    })
-                    .collect::<Vec<_>>()
-            };
-            let before = sample();
-            for millis in [100, 200, 400] {
-                r.paint(
-                    &config,
-                    &ink,
-                    Point { x: 760.0, y: 30.0 },
-                    (ui, 0),
-                    None,
-                    now + Duration::from_millis(millis),
-                );
-                cairo_surface_flush(surface);
-                assert_eq!(
-                    sample(),
-                    before,
-                    "partial repaint must not leave seams in settings"
-                );
-            }
             let empty = Ink::new();
             r.paint(
                 &config,
                 &empty,
                 Point { x: 160.0, y: 180.0 },
-                (SettingsUi::default(), 0),
+                0,
                 Some(now),
                 now,
             );
@@ -904,7 +914,7 @@ mod tests {
                     &hand,
                     &empty,
                     Point { x: 160.0, y: 180.0 },
-                    (SettingsUi::default(), 0),
+                    0,
                     None,
                     now + Duration::from_millis(millis),
                 );
@@ -915,7 +925,11 @@ mod tests {
             for (y, color) in [(180.0, colors::RED), (220.0, colors::hex(0x2F86F0))] {
                 mixed.down_with_brush(
                     Point { x: 100.0, y },
-                    crate::ink::Brush { color, width: 6.0 },
+                    crate::ink::Brush {
+                        color,
+                        width: 6.0,
+                        ..crate::ink::Brush::default()
+                    },
                 );
                 mixed.move_to(Point { x: 200.0, y });
                 mixed.end(now);
@@ -926,14 +940,7 @@ mod tests {
                 match_color: false,
                 ..Config::default()
             };
-            r.paint(
-                &fixed,
-                &mixed,
-                Point { x: 760.0, y: 30.0 },
-                (SettingsUi::default(), 0),
-                None,
-                now,
-            );
+            r.paint(&fixed, &mixed, Point { x: 760.0, y: 30.0 }, 0, None, now);
             cairo_surface_flush(surface);
             assert!(
                 red(150, 180) > 240 && *data.add(180 * stride + 150 * 4) < 60,

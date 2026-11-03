@@ -1,165 +1,133 @@
 # TinyHand for Linux
 
-Native Rust and X11 presentation pointer inspired by [TinyHand](https://github.com/nilbuild/tinyhand).
-The original artwork and tap sample are included with attribution and their MIT license.
+A native Rust/X11 port of [TinyHand](https://github.com/nilbuild/tinyhand), for
+Linux Mint Cinnamon and other composited X11 desktops. It includes the original
+36 hand artworks, laser pointer, ink colours and six tap sounds. Settings use
+**GTK 3**; the transparent pointer and toolbar use **Cairo and X11**.
 
-**Cinnamon compatibility:** Version 0.1.5 disables the legacy XEmbed tray on
-Cinnamon/Muffin. The tray path reproduced the compositor crash in an isolated
-Cinnamon session, with the same stack trace as the earlier live crashes.
-Detection checks both desktop variables and the actual X11 window manager.
-Use `Ctrl+Alt+H` to toggle presentation mode and `Esc` to restore normal clicks.
-The former Cinnamon startup block and development override are no longer used.
+## Install and run
 
-## Install
-
-On a compatible Debian based x86_64 X11 desktop:
+Install the Debian package, or extract the portable archive and run its binary:
 
 ```sh
-sudo apt install ./tinyhand-rs_0.1.5_amd64.deb
+sudo apt install ./tinyhand-rs_0.2.0_amd64.deb
+tinyhand-rs
 ```
 
-Launch **TinyHand for Linux** in the application menu, or run `tinyhand-rs`.
-The executable and assets are also available in the portable archive. Extract it
-and run `./tinyhand-rs` from its directory. Rust and Cargo are not needed to use
-either release. Other distributions can use the portable archive after installing
-the shared runtime libraries listed below.
+The app opens settings without capturing your pointer. Click **Start pointer**
+to present. Click to tap; hold the left button and drag to draw. Right and middle
+buttons tap without drawing. Hold **Alt** to use the underlying app normally,
+including clicking, dragging and scrolling. The interaction key can be changed
+to Control or Super, or disabled. Settings can keep the hand visible while you
+interact. Panels, docks and popup menus receive ordinary clicks automatically.
 
-Required runtime libraries: X11, Xext, Xrender, Xinerama, Cairo and ALSA.
-A compositing manager with a 32 bit ARGB visual is needed for transparency.
-Cinnamon normally provides one.
+**Escape** exits presentation mode. **Ctrl+Alt+H** toggles it globally;
+**Ctrl+Alt+X** clears ink. Shortcuts can use Control, Alt, Super and Shift with
+letters, numbers, function keys and supported navigation keys. Conflicting edits
+restore the previous shortcuts.
 
-## Use
+The toolbar sits eight logical pixels above the desktop panel. It fades away
+when you draw or move away; approach the bottom of the screen to reveal it.
+Choose a pinned hand, change ink colour, mute taps, clear, open settings or exit.
+Drag pointers to reorder them, or drag them away to remove them. Settings offers
+all 37 pointers, up to eight toolbar pins, a replacement picker when full, and a toolbar reset.
 
-The app starts in presentation mode. The hand follows the real pointer.
-The normal cursor is hidden while the X11 pointer grab is active.
-The hand aims toward a grip below the current monitor, with a gently following
-rod. Pressing compresses the hand and lowers its shadow; releasing lets it ease
-back to rest. The fingertip stays aligned with the actual pointer. Appearance's
-tilt control adds an angle offset to this natural aim. Animation stops when the
-grip and press motion have settled.
+The modern StatusNotifier tray provides start/stop, clear, sound, settings and
+quit actions on desktops with a compatible host. TinyHand never creates an
+XEmbed tray window. You can also control the running instance from a terminal:
 
-| Action | Result |
-| --- | --- |
-| Click | Tap pulse and optional sound, with no click delivered to the underlying app |
-| Hold and drag | Draw a line; after release it fades in about 3 seconds by default |
-| Scroll | Move through the 36 hands and laser dot |
-| Toolbar `Hands` | Open the grid; click again for the laser dot page |
-| Toolbar arrows | Previous or next pointer |
-| Toolbar `Sound on` or `Muted` | Toggle tap sound |
-| Toolbar `Clear` | Erase ink |
-| Toolbar `Settings` | Open settings panel |
-| Toolbar `Exit` or `Esc` | Exit presentation mode and restore normal clicks |
-| `Ctrl+Alt+H` | Toggle presentation mode globally |
-| `Ctrl+Alt+X` | Clear ink globally |
-| Tray left click | Toggle presentation mode |
-| Tray right click | Activate and show settings |
-| Tray middle click | Quit the process |
+```sh
+tinyhand-rs --present
+tinyhand-rs --settings
+tinyhand-rs --toggle
+tinyhand-rs --stop
+tinyhand-rs --clear
+tinyhand-rs --quit
+```
 
-The toolbar appears near the bottom of the monitor containing the pointer.
-It uses the desktop's usable work area and leaves an 8 logical pixel gap above
-the Cinnamon panel. The settings screen is drawn with Cairo directly on X11;
-GTK/Qt widgets are not used for that screen. Zenity provides the PNG file chooser.
-The XEmbed tray icon appears if a compatible system tray is running, except on
-Cinnamon where the legacy tray path is disabled. If there is
-no tray, use the global toggle shortcut. Closing presentation mode leaves the
-process running; middle click the tray icon, or terminate its process to quit.
+## Settings and custom hands
 
-## Settings
+The six settings pages follow the original sidebar layout: General, Pointers,
+Appearance, Drawing, Sound and About. They use native, scrollable, resizable,
+keyboard-accessible GTK controls. Opening settings releases pointer capture.
 
-The settings window follows the original TinyHand design: a dark sidebar with
-General, Pointers, Appearance, Drawing, Sound, and About pages. It offers hand
-thumbnails, PNG import, size, shadow, tilt, opacity, ink colour, fade, thickness,
-all six original tap sounds, volume, start at login, and editable shortcuts.
-Drawing defaults to **Match the pointer**, with the original colour for each
-hand and the laser. The rainbow swatch restores automatic matching; the eight
-solid swatches select a fixed colour. Existing strokes retain their own colour
-and thickness when you change a setting. Imported hands derive a readable
-colour from their artwork.
-Click a shortcut row and press a letter with Control, Alt or Shift. Settings are saved
-in `${XDG_CONFIG_HOME:-~/.config}/tinyhand-rs/settings.conf`.
-Start at login writes an XDG autostart entry in the same config tree.
-The hand is rendered above the toolbar and settings controls. Close settings
-with the red corner button. PNG import uses `zenity` and temporarily releases
-pointer capture while the native file chooser is open. An imported PNG must
-be at most 2048 x 2048 pixels and smaller than 16 MB; it remains at its chosen
-file path, so keep that file available. Install the chooser with
-`sudo apt install zenity` if necessary.
+Ink matches the selected pointer by default; eight fixed colours are available.
+Each stroke keeps its own colour, thickness and fade preference. Choose a delay
+of 3, 6 or 10 seconds, followed by a short fade, or keep lines until cleared.
+Hand and laser sounds have independent on/off preferences. New taps interrupt
+old ones rather than building a queue.
 
-## Safety and troubleshooting
+**Pointers → Make your own hand** provides an idea field, the original image
+prompt, copy/browser actions, image selection or file drop, preview, naming,
+and an Add button. Use a transparent hand-only image with one upright pointing
+finger and a flat wrist, without a rod, shadow or glow. Supported image formats
+come from GdkPixbuf. Images must be 64–4096 pixels on each side and at most
+32 MB. The app checks the shape, composes the rod and copies the result into
+its managed library; moving the original file does not break your saved hand.
+Custom hands can be pinned, selected and deleted.
 
-The app requires an X11 session. Run `echo "$XDG_SESSION_TYPE"`; it should
-print `x11`. Wayland compositors do not expose this global input grab, so this
-release does not implement Wayland presentation mode.
+Preferences live in `${XDG_CONFIG_HOME:-~/.config}/tinyhand-rs/settings.conf`.
+Custom hands live in `${XDG_DATA_HOME:-~/.local/share}/tinyhand-rs/hands`.
+Lifecycle/error logs live in
+`${XDG_STATE_HOME:-~/.local/state}/tinyhand-rs/tinyhand.log` and rotate at 1 MB
+on launch. Reset preserves custom hands and the launch-at-login preference.
+Autostart runs in the background without activating presentation mode.
 
-If the app says `XGrabPointer failed`, another application may hold an X11
-pointer grab. Exit that app and retry. If a global shortcut conflicts with the
-desktop, change it in settings. The app prints diagnostics to the terminal.
-If the background is opaque, ensure Cinnamon's compositor is enabled.
+Update/release checking is intentionally not included in this version.
 
-The X server automatically releases a pointer grab if the application process
-dies or disconnects. Normal exit, `Esc`, and SIGINT/SIGTERM explicitly release
-the grab. As a last resort after a hang, switch to another virtual terminal
-and terminate `tinyhand-rs`.
+## Build and verify
 
-## Install the build tools
-
-On Linux Mint or Ubuntu, install the native libraries and the current Rust toolchain:
+On Linux Mint or Ubuntu:
 
 ```sh
 sudo apt update
-sudo apt install -y build-essential pkg-config libx11-dev libxext-dev libxrender-dev libxinerama-dev libcairo2-dev libasound2-dev
+sudo apt install -y build-essential pkg-config libgtk-3-dev libx11-dev libxext-dev libxrender-dev libxinerama-dev libxi-dev libxtst-dev libxfixes-dev libcairo2-dev libasound2-dev
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
 . "$HOME/.cargo/env"
 rustup component add rustfmt clippy
-```
-
-Open a new terminal if `cargo` is not found after installation. Build and check the application with:
-
-```sh
 cargo fmt --all -- --check
-cargo clippy --all-targets -- -D warnings
-cargo test
-cargo build --release
+CARGO_BUILD_JOBS=1 cargo clippy --all-targets -- -D warnings
+CARGO_BUILD_JOBS=1 cargo test --all-targets
+CARGO_BUILD_JOBS=1 cargo build --release
+./target/release/tinyhand-rs
 ```
 
-The project has no third party Rust crate dependencies.
-Only run the GUI on an X11 display. Presentation mode captures mouse clicks;
-`Esc` or `Ctrl+Alt+H` releases the capture.
+One build job limits compiler memory use on smaller machines. To build the
+Debian package, portable archive and clean source archive, run
+`CARGO_BUILD_JOBS=1 scripts/package.sh`.
 
-## Verification on a real X11 desktop
+Runtime libraries: GTK 3/GdkPixbuf/Gio, X11, Xext, Xrender, Xinerama, Xi, Xtst,
+Xfixes, Cairo and ALSA. A compositor with a 32-bit ARGB visual is required.
+There is no Python, web server or browser runtime in the app.
 
-1. Start from a terminal and confirm the hand and toolbar appear. Cinnamon
-   intentionally has no legacy tray icon.
-2. Move across each display and check pointer alignment and toolbar placement.
-3. Open a text editor beneath the overlay. Click in it and confirm focus and
-   text cursor do not move; hold and drag to see an ink line fade after release.
-4. Press `Ctrl+Alt+X` to clear; press `Esc` and verify a normal click now reaches
-   the editor immediately. Toggle on again with `Ctrl+Alt+H`.
-5. Select a hand and laser dot, adjust every settings control, quit and restart,
-   then check that preferences persisted. Try the tray actions and audio toggle.
-6. Try a resolution change and reconnect a second display if available.
-
-## Verification limits
-
-The repeatable compositor regression test uses a separate Xvfb display, private
-D-Bus session, temporary settings, and software rendering. It checks visible
-ink, click capture and release, settings persistence, shortcuts, repeated
-startup/shutdown, and delayed compositor stack updates. Run it with:
+The integration test runs in its own Xvfb, private D-Bus and Cinnamon session.
+It never sends input to your current desktop:
 
 ```sh
-sudo apt install xvfb xdotool x11-utils imagemagick python3-pil zenity
-cargo build --release
-python3 scripts/test-cinnamon.py --cycles 20
+sudo apt install xvfb cinnamon dbus-x11 xdotool x11-utils x11-apps imagemagick python3-pil python3-gi python3-pyatspi
+python3 scripts/test-cinnamon.py --cycles 3
 ```
 
-Cinnamon must also be installed. Logs and screenshots stay in the printed
-temporary directory. The test never sends input to your existing display.
-Sound output and physical multi monitor switching remain unverified.
-No Wayland global input capture is claimed. See `BUILD_REPORT.md` for results.
-The complete source comparison and remaining feature gaps are recorded in
-`UPSTREAM_PARITY.md`. To verify all 37 colour definitions, 36 artworks and six
-sound files against a local original checkout, run:
+It tests native settings through accessibility actions, custom-hand import,
+input capture and interaction, drawing, tray protocol, shortcuts, idle CPU and
+repeated teardown. Logs and screenshots remain in the printed temporary folder.
+For image validation/composition without launching the UI:
 
 ```sh
-python3 scripts/check-upstream.py --upstream /home/minty/data/tinyhand-original
+tinyhand-rs --make-hand input.png composed.png
 ```
+
+## Troubleshooting
+
+Use an **X11 login session**. Wayland presentation is unsupported; an XWayland
+window cannot capture input across native Wayland applications. Check with
+`echo "$XDG_SESSION_TYPE"`.
+
+If a shortcut conflicts with another app, change it in General. If presentation
+cannot capture the pointer, close another application's popup/grab and retry.
+If the overlay becomes opaque, check that the compositor is running. Escape,
+normal exit and SIGINT/SIGTERM release capture. The X server also releases it
+if the process dies. `tinyhand-rs --quit` stops the running instance.
+
+Original TinyHand artwork, sounds and prompt are MIT licensed by Kamran Ahmed;
+see [NOTICE.md](NOTICE.md) and [assets/LICENSE.upstream](assets/LICENSE.upstream).

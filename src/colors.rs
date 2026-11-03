@@ -53,6 +53,8 @@ pub const POINTER_COLORS: [(&str, Rgb); 37] = [
 
 // Keep legacy fixed-colour indices, using the former duplicate-purple slot
 // for yellow. Config::load migrates old slot 5 to the retained purple slot.
+// Visual order follows upstream InkChoice while preserving saved colour IDs.
+pub const SWATCH_ORDER: [usize; 8] = [1, 2, 5, 3, 4, 0, 6, 7];
 pub const SWATCHES: [Rgb; 8] = [
     hex(0x8754F2),
     RED,

@@ -3,8 +3,10 @@
 This independent Linux implementation is based on TinyHand by Kamran Ahmed,
 https://github.com/nilbuild/tinyhand, licensed under MIT.
 
-The 36 `assets/hand_*.png` files are downsampled from the original artwork.
-All six `assets/sounds/tap_*.wav` samples and the icon originate in the same repository.
+The 36 `assets/hand_*.png` artworks and all six
+`assets/sounds/tap_*.wav` samples are copied unchanged from that repository.
+The image prompt in `assets/hand-prompt.txt` is adapted from `HandMaker.swift`.
+The renderer caches smaller images as needed at runtime.
 The original license is preserved at `assets/LICENSE.upstream` and included
 in every distribution package.
 

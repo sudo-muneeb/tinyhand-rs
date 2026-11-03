@@ -1,0 +1,16 @@
+Make a pointer image for TinyHand, a Mac app that shows a toy hand on screen.
+
+Draw one cartoon right hand in this style: [describe your hand, e.g. knitted wool in mustard yellow]
+
+Rules:
+- We see the BACK of the hand. The palm faces away from us. The knuckles and the smooth back of the hand face the viewer.
+- The index finger points straight up. The other three fingers are folded down, so we only see their knuckles, never their fingertips or fingernails.
+- The raised index finger sits at the far left of the knuckle row, right next to the thumb. Three folded knuckles sit to its right. It must never look like a middle finger.
+- The thumb is tucked against the left side of the hand. Nothing crosses the front of the fist: no thumb, no fingertips, no fingernails, no palm.
+- The fingertip is the highest point of the image. Nothing above or beside it.
+- The hand ends at the bottom in a wrist cuff or a clean flat wrist, facing straight down, centred.
+- Upright, not tilted. Whole hand visible, nothing cropped.
+- Transparent background. No shadow, no floor, no outline glow, no text, no stick, no arm.
+- Soft 3D toy look, bright and readable at small sizes.
+- Portrait image, hand filling most of the height with a little empty space around it.
+

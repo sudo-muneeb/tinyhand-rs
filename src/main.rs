@@ -120,6 +120,7 @@ struct App {
     cursor: Point,
     pressed: Option<Instant>,
     active: bool,
+    pending_start: Option<(Instant, Instant)>,
     tx: Sender<Event>,
     rx: Receiver<Event>,
     preferences: SettingsWindow,
@@ -276,6 +277,7 @@ impl App {
             },
             pressed: None,
             active: false,
+            pending_start: None,
             tx,
             rx,
             preferences,
@@ -446,9 +448,9 @@ impl App {
         }
     }
 
-    unsafe fn activate(&mut self) -> Result<(), String> {
+    unsafe fn activate(&mut self) -> Result<bool, String> {
         if self.active {
-            return Ok(());
+            return Ok(true);
         }
         if std::env::var("XDG_SESSION_TYPE").as_deref() == Ok("wayland") {
             return Err("Presentation needs an X11 login session. XWayland cannot capture input across Wayland applications.".into());
@@ -459,9 +461,14 @@ impl App {
         // run() already bounds event batches and rendering frequency.
         let mask = (1 << 6) | (1 << 2) | (1 << 3);
         let status = XGrabPointer(self.display, self.root, 0, mask, 1, 1, 0, self.invisible, 0);
+        // Tray hosts and GTK menus can still own a short-lived grab while
+        // dispatching Activate. Retry from the main loop after they release it.
+        if status == 1 || status == 4 {
+            return Ok(false);
+        }
         if status != 0 {
             return Err(format!(
-                "XGrabPointer failed ({status}). Another program may have captured the pointer."
+                "Could not start the pointer (X11 status {status})."
             ));
         }
         self.input.buttons = 0;
@@ -502,10 +509,11 @@ impl App {
         }
         self.draw();
         XFlush(self.display);
-        Ok(())
+        Ok(true)
     }
 
     unsafe fn deactivate(&mut self) {
+        self.pending_start = None;
         if !self.active {
             return;
         }
@@ -757,7 +765,7 @@ impl App {
                 Err(e) => self.preferences.message(&e),
             },
             Event::Toggle => {
-                if self.active {
+                if self.active || self.pending_start.is_some() {
                     self.deactivate();
                 } else {
                     self.desktop_event(Event::Start);
@@ -765,9 +773,12 @@ impl App {
             }
             Event::Start => {
                 self.preferences.window.hide();
-                if let Err(e) = self.activate() {
-                    self.open_settings();
-                    self.preferences.message(&e);
+                if !self.active && self.pending_start.is_none() {
+                    let now = Instant::now();
+                    self.pending_start = Some((
+                        now + Duration::from_millis(40),
+                        now + Duration::from_secs(2),
+                    ));
                 }
             }
             Event::Stop => self.deactivate(),
@@ -1054,7 +1065,7 @@ impl App {
     unsafe fn run(&mut self) -> Result<(), String> {
         let present = std::env::args().any(|s| s == "--present" || s == "--toggle");
         if present {
-            self.activate()?;
+            self.desktop_event(Event::Start);
         } else if !std::env::args().any(|s| s == "--background") || !self.config.welcomed {
             self.open_settings();
             if !self.config.welcomed {
@@ -1095,6 +1106,29 @@ impl App {
                 self.input.clear_replayed();
             }
             let now = Instant::now();
+            if let Some((attempt, deadline)) = self.pending_start {
+                if now >= attempt {
+                    // Never capture the click that launched presentation. It
+                    // must finish in the panel/menu before drawing can begin.
+                    let result = if self.query_pointer() & (31 << 8) == 0 {
+                        self.activate()
+                    } else {
+                        Ok(false)
+                    };
+                    match result {
+                        Ok(true) => self.pending_start = None,
+                        Ok(false) if now < deadline => {
+                            self.pending_start = Some((now + Duration::from_millis(40), deadline));
+                        }
+                        result => {
+                            let error = result.err().unwrap_or_else(||
+                                "Another app is using the pointer. Close its menu or dialog, then try again.".into());
+                            self.open_settings();
+                            self.preferences.message(&error);
+                        }
+                    }
+                }
+            }
             if self.active {
                 if !self.passing {
                     let interaction = self
@@ -1230,6 +1264,14 @@ impl App {
                 .ink
                 .next_change(now)
                 .map_or(wait, |d| wait.min(d.as_millis().max(1) as u64));
+            if let Some((attempt, _)) = self.pending_start {
+                wait = wait.min(
+                    attempt
+                        .saturating_duration_since(Instant::now())
+                        .as_millis()
+                        .max(1) as u64,
+                );
+            }
             if let Some(deadline) = self.restore_at {
                 if deadline > now {
                     wait = wait.min((deadline - now).as_millis().max(1) as u64);

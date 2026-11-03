@@ -14,8 +14,9 @@ sudo apt install ./tinyhand-rs_0.2.2_amd64.deb
 tinyhand-rs
 ```
 
-The app opens settings without capturing your pointer. Click **Start pointer**
-to present. Click to tap; hold the left button and drag to draw. Right and middle
+The application launcher and tray icon start or stop the pointer directly.
+Open **Settings** from the tray menu, or run `tinyhand-rs --settings`. Running
+`tinyhand-rs` in a terminal opens settings; click **Start pointer** to present. Click to tap; hold the left button and drag to draw. Right and middle
 buttons tap without drawing. Hold **Alt** to use the underlying app normally,
 including clicking, dragging and scrolling. The interaction key can be changed
 to Control or Super, or disabled. Settings can keep the hand visible while you

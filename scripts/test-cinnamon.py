@@ -222,6 +222,34 @@ def main():
             before=probe_clicks();wait(lambda:(click() or probe_clicks()>before),'Settings kept the pointer grab',3)
             command('--present');wait(visible,'Remote start failed')
             run('xdotool','key','Escape');wait(lambda:not visible(),'Escape failed')
+            if cycle==0:
+                # Reproduce a tray/menu owning the pointer while Activate arrives.
+                x=ctypes.CDLL('libX11.so.6')
+                x.XOpenDisplay.argtypes=[ctypes.c_char_p];x.XOpenDisplay.restype=ctypes.c_void_p
+                x.XDefaultRootWindow.argtypes=[ctypes.c_void_p];x.XDefaultRootWindow.restype=ctypes.c_ulong
+                x.XGrabPointer.argtypes=[ctypes.c_void_p,ctypes.c_ulong,ctypes.c_int,ctypes.c_uint,ctypes.c_int,ctypes.c_int,ctypes.c_ulong,ctypes.c_ulong,ctypes.c_ulong]
+                x.XUngrabPointer.argtypes=[ctypes.c_void_p,ctypes.c_ulong]
+                x.XSync.argtypes=[ctypes.c_void_p,ctypes.c_int];x.XCloseDisplay.argtypes=[ctypes.c_void_p]
+                client=x.XOpenDisplay(env['DISPLAY'].encode());assert client
+                def tray_activate():
+                    run('gdbus','call','--session','--dest',name,'--object-path','/StatusNotifierItem','--method','org.kde.StatusNotifierItem.Activate','0','0')
+                try:
+                    assert x.XGrabPointer(client,x.XDefaultRootWindow(client),0,0,1,1,0,0,0)==0
+                    tray_activate();time.sleep(.3);assert not visible(),'Presentation stole the menu grab'
+                    x.XUngrabPointer(client,0);x.XSync(client,0)
+                    wait(visible,'Tray activation failed after the menu released its grab')
+                    tray_activate();wait(lambda:not visible(),'Tray activation did not stop presentation')
+                    run('xdotool','mousedown','1');tray_activate();time.sleep(.2)
+                    assert not visible(),'Presentation captured its launch click'
+                    run('xdotool','mouseup','1');wait(visible,'Tray activation failed after mouse release')
+                    tray_activate();wait(lambda:not visible(),'Tray stop failed')
+                    assert x.XGrabPointer(client,x.XDefaultRootWindow(client),0,0,1,1,0,0,0)==0
+                    tray_activate();time.sleep(.15);command('--stop')
+                    x.XUngrabPointer(client,0);x.XSync(client,0);time.sleep(.3)
+                    assert not visible(),'Cancelled activation started later'
+                finally:
+                    run('xdotool','mouseup','1');x.XUngrabPointer(client,0);x.XCloseDisplay(client)
+                print('Tray grab recovery, launch click release, toggle and cancellation passed',flush=True)
             run('xdotool','key','ctrl+alt+h');wait(visible,'Global shortcut failed')
             command('--clear');run('xdotool','mousemove','1100','100');time.sleep(4)
             def ticks():return sum(map(int,Path(f'/proc/{app.pid}/stat').read_text().split()[13:15]))

@@ -216,6 +216,37 @@ def main():
                     actual=screenshot('quick-blue-ink').getpixel((400,300));return max(abs(a-b) for a,b in zip(actual,(10,132,255)))<=2
                 wait(blue_ready,'The quick palette did not render blue ink',3)
                 run('xdotool','mouseup','1');time.sleep(3.9);assert screenshot('faded-ink').getpixel((400,300))==(0,0,0),'Ink did not finish fading'
+                # Check the complete upstream InkChoice palette through actual
+                # clicks and composited stroke pixels, not just saved values.
+                def quick_colour(slot):
+                    run('xdotool','mousemove',str(round(bx+28+count*44)),str(round(by+27)));time.sleep(.3)
+                    click(round(bx+28+count*44),round(by+27));time.sleep(.12)
+                    if slot==0:screenshot('colour-palette-match')
+                    click(round(bx+23+slot*40),round(by-35))
+                def assert_ink(rgb,label):
+                    command('--clear');run('xdotool','mousemove','300','300','mousedown','1','mousemove','700','300')
+                    try:
+                        wait(lambda:max(abs(a-b) for a,b in zip(screenshot('colour-'+label).getpixel((400,300)),rgb))<=2,'Wrong rendered ink: '+label,3)
+                    finally:run('xdotool','mouseup','1')
+                for slot,(index,rgb) in enumerate([(1,(255,41,31)),(2,(255,138,0)),(5,(255,204,0)),(3,(48,194,90)),(4,(10,132,255)),(0,(135,84,242)),(6,(255,255,255)),(7,(29,29,33))],1):
+                    quick_colour(slot)
+                    wait(lambda:f'color={index}\n' in cfg.read_text() and 'match_color=false' in cfg.read_text(),'Colour choice did not persist')
+                    assert_ink(rgb,str(slot))
+                # Glove and plush have deliberately different default inks.
+                def choose_pinned(pointer):
+                    nonlocal count,bx
+                    pins=cfg.read_text().split('pinned=')[1].splitlines()[0].split(',')
+                    run('xdotool','mousemove',str(round(bx+28+pins.index(pointer)*44)),str(round(by+27)));time.sleep(.3)
+                    click(round(bx+28+pins.index(pointer)*44),round(by+27))
+                    wait(lambda:f'style={pointer}\n' in cfg.read_text(),'Toolbar pointer selection failed')
+                    count=len(pins);width=(count+5)*44+12;bx=(1280-width)/2
+                choose_pinned('glove');assert_ink((29,29,33),'fixed-after-hand-switch')
+                quick_colour(0);wait(lambda:'match_color=true' in cfg.read_text(),'Automatic colour did not persist')
+                assert_ink((135,84,242),'match-glove')
+                choose_pinned('plush');assert_ink((47,134,240),'match-plush')
+                assert 'match_color=true' in cfg.read_text(),'Hand switch disabled automatic colour'
+                command('--clear')
+                print('All eight ink colours, fixed colour persistence and automatic hand matching passed',flush=True)
             command('--settings');wait(lambda:not visible(),'Opening settings did not release input')
             wait(lambda:find('Start pointer') is not None,'Native settings did not become ready')
             run('xdotool','windowactivate','--sync',probe_id)
